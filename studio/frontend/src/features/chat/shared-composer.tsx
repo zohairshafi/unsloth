@@ -339,7 +339,8 @@ export function SharedComposer({
     // Generalized compare: load each model before dispatching to its side
     const hasCompareHandles = Boolean(handlesRef.current["model1"] || handlesRef.current["model2"]);
     const isGeneralizedCompare = hasCompareHandles && Boolean(model1?.id || model2?.id);
-    if (isGeneralizedCompare) {
+    const useUpstream = useChatRuntimeStore.getState().useUpstream;
+    if (isGeneralizedCompare && !useUpstream) {
       const store = useChatRuntimeStore.getState();
       const maxSeqLength = store.params.maxSeqLength;
       const trustRemoteCode = store.params.trustRemoteCode ?? false;
