@@ -297,6 +297,79 @@ _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT = max(
     int(os.getenv("UNSLOTH_WIKI_PENDING_INGEST_MAX_FILES_PER_CHAT", "1")),
 )
 _LAST_PENDING_RAW_INGEST_AT: Optional[float] = None
+_LLM_UPSTREAM_BASE_URL = os.getenv("UNSLOTH_LLM_UPSTREAM_BASE_URL", "").strip()
+_LLM_UPSTREAM_API_KEY = os.getenv("UNSLOTH_LLM_UPSTREAM_API_KEY", "").strip()
+_LLM_UPSTREAM_MODEL = os.getenv("UNSLOTH_LLM_UPSTREAM_MODEL", "").strip()
+try:
+    _LLM_UPSTREAM_TIMEOUT_SECONDS = max(
+        10,
+        int(os.getenv("UNSLOTH_LLM_UPSTREAM_TIMEOUT_SECONDS", "600")),
+    )
+except ValueError:
+    _LLM_UPSTREAM_TIMEOUT_SECONDS = 600
+_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK = os.getenv(
+    "UNSLOTH_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK",
+    "true",
+).strip().lower() not in {"0", "false", "no", "off"}
+_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK = os.getenv(
+    "UNSLOTH_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK",
+    "false",
+).strip().lower() not in {"0", "false", "no", "off"}
+_UNSLOTH_ONLY_OPENAI_FIELDS = {
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "image_base64",
+    "audio_base64",
+    "use_adapter",
+    "enable_thinking",
+    "enable_tools",
+    "enabled_tools",
+    "auto_heal_tool_calls",
+    "max_tool_calls_per_message",
+    "tool_call_timeout",
+    "session_id",
+}
+
+
+def _normalize_openai_base_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        return ""
+    if normalized.lower().endswith("/v1"):
+        return normalized
+    return f"{normalized}/v1"
+
+
+def _llm_upstream_base_url() -> str:
+    return _normalize_openai_base_url(_LLM_UPSTREAM_BASE_URL)
+
+
+def _llm_upstream_enabled() -> bool:
+    return bool(_llm_upstream_base_url() and _LLM_UPSTREAM_API_KEY)
+
+
+def _llm_upstream_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_LLM_UPSTREAM_API_KEY}"}
+
+
+def _llm_upstream_completions_fallback_enabled() -> bool:
+    return _llm_upstream_enabled() and _LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK
+
+
+def _llm_upstream_embeddings_fallback_enabled() -> bool:
+    return _llm_upstream_enabled() and _LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK
+
+
+def _resolve_llm_upstream_model(requested_model: Optional[str]) -> str:
+    requested = (requested_model or "").strip()
+    if requested and requested not in {"default", "current"}:
+        return requested
+    if _LLM_UPSTREAM_MODEL:
+        return _LLM_UPSTREAM_MODEL
+    if requested:
+        return requested
+    return "default"
 
 
 def _loggable_rag_context(context: str) -> str:
@@ -318,9 +391,11 @@ def _wiki_llm_available() -> bool:
         pass
     try:
         backend = get_inference_backend()
-        return bool(getattr(backend, "active_model_name", None))
+        if bool(getattr(backend, "active_model_name", None)):
+            return True
     except Exception:
-        return False
+        pass
+    return _llm_upstream_enabled()
 
 
 def _supports_enable_wiki_rag_history_arg(generate_fn: Any) -> bool:
@@ -411,6 +486,40 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                 return out.strip()
     except Exception as exc:
         logger.warning(f"Transformer wiki LLM call failed, falling back: {exc}")
+
+    if _llm_upstream_enabled():
+        try:
+            target_url = f"{_llm_upstream_base_url()}/chat/completions"
+            upstream_model = _resolve_llm_upstream_model(None)
+            body = {
+                "model": upstream_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temp,
+                "top_p": top_p,
+                "max_tokens": _WIKI_LLM_MAX_TOKENS,
+                "stream": False,
+            }
+            with httpx.Client(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    target_url,
+                    json = body,
+                    headers = _llm_upstream_headers(),
+                )
+            if response.status_code == 200:
+                data = response.json()
+                first_choice = (data.get("choices") or [{}])[0]
+                message = first_choice.get("message") or {}
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            else:
+                logger.warning(
+                    "Upstream wiki LLM call failed: status=%s body=%s",
+                    response.status_code,
+                    response.text[:240],
+                )
+        except Exception as exc:
+            logger.warning("Upstream wiki LLM call failed, falling back: %s", exc)
 
     # Final fallback keeps ingestion resilient when no model is loaded.
     return prompt
@@ -2164,6 +2273,249 @@ def _extract_content_parts(
     return system_prompt, chat_messages, first_image_b64
 
 
+def _build_openai_upstream_body(
+    payload: ChatCompletionRequest,
+    model_name: str,
+) -> dict[str, Any]:
+    body = payload.model_dump(exclude_none = True)
+    body["messages"] = _openai_messages_for_passthrough(payload)
+    body["model"] = model_name
+    for field in _UNSLOTH_ONLY_OPENAI_FIELDS:
+        body.pop(field, None)
+    return body
+
+
+async def _openai_upstream_chat_stream(
+    request: Request,
+    payload: ChatCompletionRequest,
+    model_name: str,
+):
+    target_url = f"{_llm_upstream_base_url()}/chat/completions"
+    body = _build_openai_upstream_body(payload, model_name)
+    body["stream"] = True
+
+    client = httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS)
+    resp = None
+    try:
+        req = client.build_request(
+            "POST",
+            target_url,
+            json = body,
+            headers = _llm_upstream_headers(),
+        )
+        resp = await client.send(req, stream = True)
+    except httpx.RequestError as exc:
+        if resp is not None:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Failed to reach upstream model server: {exc}",
+        )
+
+    if resp.status_code != 200:
+        err_bytes = await resp.aread()
+        err_text = err_bytes.decode("utf-8", errors = "replace")
+        upstream_status = resp.status_code
+        try:
+            await resp.aclose()
+        except Exception:
+            pass
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code = upstream_status,
+            detail = f"Upstream model server error: {err_text[:500]}",
+        )
+
+    async def _stream():
+        lines_iter = None
+        try:
+            lines_iter = resp.aiter_lines()
+            async for raw_line in lines_iter:
+                if await request.is_disconnected():
+                    break
+                if not raw_line:
+                    continue
+                if not raw_line.startswith("data: "):
+                    continue
+                yield raw_line + "\n\n"
+                if raw_line[6:].strip() == "[DONE]":
+                    break
+        except Exception as exc:
+            logger.error("openai upstream stream error: %s", exc)
+            err = {
+                "error": {
+                    "message": f"Failed to stream from upstream model server: {exc}",
+                    "type": "server_error",
+                },
+            }
+            yield f"data: {json.dumps(err)}\n\n"
+        finally:
+            if lines_iter is not None:
+                try:
+                    await lines_iter.aclose()
+                except Exception:
+                    pass
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _stream(),
+        media_type = "text/event-stream",
+        headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _openai_upstream_chat_non_streaming(
+    payload: ChatCompletionRequest,
+    model_name: str,
+):
+    target_url = f"{_llm_upstream_base_url()}/chat/completions"
+    body = _build_openai_upstream_body(payload, model_name)
+    body["stream"] = False
+
+    try:
+        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                target_url,
+                json = body,
+                headers = _llm_upstream_headers(),
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Failed to reach upstream model server: {exc}",
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code = resp.status_code,
+            detail = f"Upstream model server error: {resp.text[:500]}",
+        )
+
+    return Response(content = resp.content, media_type = "application/json")
+
+
+async def _openai_upstream_passthrough(
+    request: Request,
+    endpoint: str,
+    *,
+    allow_stream: bool,
+):
+    body = await request.json()
+    target_url = f"{_llm_upstream_base_url()}/{endpoint.lstrip('/')}"
+    wants_stream = bool(body.get("stream", False)) if allow_stream else False
+
+    if wants_stream:
+        client = httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS)
+        resp = None
+        try:
+            req = client.build_request(
+                "POST",
+                target_url,
+                json = body,
+                headers = _llm_upstream_headers(),
+            )
+            resp = await client.send(req, stream = True)
+        except httpx.RequestError as exc:
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code = status.HTTP_502_BAD_GATEWAY,
+                detail = f"Failed to reach upstream model server: {exc}",
+            )
+
+        if resp.status_code != 200:
+            err_bytes = await resp.aread()
+            err_text = err_bytes.decode("utf-8", errors = "replace")
+            upstream_status = resp.status_code
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code = upstream_status,
+                detail = f"Upstream model server error: {err_text[:500]}",
+            )
+
+        async def _stream():
+            bytes_iter = None
+            try:
+                bytes_iter = resp.aiter_bytes()
+                async for chunk in bytes_iter:
+                    if await request.is_disconnected():
+                        break
+                    if chunk:
+                        yield chunk
+            except Exception as exc:
+                logger.error("openai upstream %s stream error: %s", endpoint, exc)
+            finally:
+                if bytes_iter is not None:
+                    try:
+                        await bytes_iter.aclose()
+                    except Exception:
+                        pass
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
+        return StreamingResponse(_stream(), media_type = "text/event-stream")
+
+    try:
+        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                target_url,
+                json = body,
+                headers = _llm_upstream_headers(),
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Failed to reach upstream model server: {exc}",
+        )
+
+    return Response(
+        content = resp.content,
+        status_code = resp.status_code,
+        media_type = "application/json",
+    )
+
+
 @router.post("/chat/completions")
 async def openai_chat_completions(
     payload: ChatCompletionRequest,
@@ -2194,6 +2546,18 @@ async def openai_chat_completions(
     else:
         backend = get_inference_backend()
         if not backend.active_model_name:
+            if _llm_upstream_enabled():
+                upstream_model = _resolve_llm_upstream_model(payload.model)
+                if payload.stream:
+                    return await _openai_upstream_chat_stream(
+                        request,
+                        payload,
+                        upstream_model,
+                    )
+                return await _openai_upstream_chat_non_streaming(
+                    payload,
+                    upstream_model,
+                )
             raise HTTPException(
                 status_code = 400,
                 detail = "No model loaded. Call POST /inference/load first.",
@@ -3182,28 +3546,64 @@ async def openai_list_models(
     OpenAI-compatible clients (``GET /v1/models``).
     """
     models = []
+    seen_ids: set[str] = set()
+
+    def _append_model(model_id: Optional[str], owned_by: str) -> None:
+        if not model_id:
+            return
+        clean_id = str(model_id).strip()
+        if not clean_id or clean_id in seen_ids:
+            return
+        seen_ids.add(clean_id)
+        models.append(
+            {
+                "id": clean_id,
+                "object": "model",
+                "owned_by": owned_by,
+            }
+        )
 
     # Check GGUF backend
     llama_backend = get_llama_cpp_backend()
     if llama_backend.is_loaded:
-        models.append(
-            {
-                "id": llama_backend.model_identifier,
-                "object": "model",
-                "owned_by": "local",
-            }
-        )
+        _append_model(llama_backend.model_identifier, "local")
 
     # Check Unsloth backend
     backend = get_inference_backend()
     if backend.active_model_name:
-        models.append(
-            {
-                "id": backend.active_model_name,
-                "object": "model",
-                "owned_by": "local",
-            }
-        )
+        _append_model(backend.active_model_name, "local")
+
+    # Optional upstream OpenAI-compatible model catalog
+    if _llm_upstream_enabled():
+        target_url = f"{_llm_upstream_base_url()}/models"
+        try:
+            timeout = min(30, _LLM_UPSTREAM_TIMEOUT_SECONDS)
+            async with httpx.AsyncClient(timeout = timeout) as client:
+                response = await client.get(
+                    target_url,
+                    headers = _llm_upstream_headers(),
+                )
+            if response.status_code == 200:
+                payload = response.json()
+                for item in payload.get("data") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    _append_model(
+                        item.get("id"),
+                        str(item.get("owned_by") or "upstream"),
+                    )
+            else:
+                logger.warning(
+                    "Upstream /models request failed: status=%s body=%s",
+                    response.status_code,
+                    response.text[:240],
+                )
+        except Exception as exc:
+            logger.warning("Upstream /models request failed: %s", exc)
+
+        fallback_model = _resolve_llm_upstream_model(None)
+        if fallback_model not in {"default", "current"}:
+            _append_model(fallback_model, "upstream")
 
     return {"object": "list", "data": models}
 
@@ -3222,10 +3622,16 @@ async def openai_completions(
     OpenAI-compatible text completions endpoint (non-chat).
 
     Transparently proxies to the running llama-server's ``/v1/completions``.
-    Only available when a GGUF model is loaded.
+    Optionally falls back to the configured upstream OpenAI-compatible server.
     """
     llama_backend = get_llama_cpp_backend()
     if not llama_backend.is_loaded:
+        if _llm_upstream_completions_fallback_enabled():
+            return await _openai_upstream_passthrough(
+                request,
+                "completions",
+                allow_stream = True,
+            )
         raise HTTPException(
             status_code = 503,
             detail = "No GGUF model loaded. Load a GGUF model first.",
@@ -3299,12 +3705,18 @@ async def openai_embeddings(
     OpenAI-compatible embeddings endpoint.
 
     Transparently proxies to the running llama-server's ``/v1/embeddings``.
-    Only available when a GGUF model is loaded.
+    Optional upstream fallback is available but disabled by default.
     Note: the loaded model must support pooling; otherwise llama-server
     will return an error (expected).
     """
     llama_backend = get_llama_cpp_backend()
     if not llama_backend.is_loaded:
+        if _llm_upstream_embeddings_fallback_enabled():
+            return await _openai_upstream_passthrough(
+                request,
+                "embeddings",
+                allow_stream = False,
+            )
         raise HTTPException(
             status_code = 503,
             detail = "No GGUF model loaded. Load a GGUF model first.",

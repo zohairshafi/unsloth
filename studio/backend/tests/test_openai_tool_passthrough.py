@@ -27,6 +27,7 @@ sys.path.insert(0, _backend)
 import httpx
 import pytest
 from pydantic import ValidationError
+import routes.inference as inference_routes
 
 from models.inference import (
     ChatCompletionRequest,
@@ -37,8 +38,14 @@ from core.inference.anthropic_compat import (
 )
 from routes.inference import (
     _build_passthrough_payload,
+    _build_openai_upstream_body,
     _friendly_error,
+    _llm_upstream_completions_fallback_enabled,
+    _llm_upstream_embeddings_fallback_enabled,
     _looks_like_history_intent,
+    _normalize_openai_base_url,
+    _resolve_llm_upstream_model,
+    _wiki_llm_available,
 )
 
 
@@ -418,6 +425,121 @@ class TestBuildPassthroughPayloadToolChoice:
         body = _build_passthrough_payload(**self._args(), repetition_penalty = 1.1)
         assert body.get("repeat_penalty") == 1.1
         assert "repetition_penalty" not in body
+
+
+# =====================================================================
+# OpenAI upstream helpers
+# =====================================================================
+
+
+class TestOpenAIUpstreamHelpers:
+    def test_normalize_openai_base_url_appends_v1(self):
+        assert (
+            _normalize_openai_base_url("https://integrate.api.nvidia.com")
+            == "https://integrate.api.nvidia.com/v1"
+        )
+
+    def test_normalize_openai_base_url_keeps_existing_v1(self):
+        assert (
+            _normalize_openai_base_url("https://integrate.api.nvidia.com/v1/")
+            == "https://integrate.api.nvidia.com/v1"
+        )
+
+    def test_resolve_upstream_model_uses_env_default_for_aliases(self, monkeypatch):
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_MODEL",
+            "meta/llama-3.1-8b-instruct",
+        )
+        assert _resolve_llm_upstream_model("default") == "meta/llama-3.1-8b-instruct"
+        assert _resolve_llm_upstream_model("current") == "meta/llama-3.1-8b-instruct"
+        assert _resolve_llm_upstream_model("custom/model") == "custom/model"
+
+    def test_build_openai_upstream_body_strips_unsloth_only_fields(self):
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hello"}],
+            stream = False,
+            enable_tools = True,
+            enabled_tools = ["python"],
+            session_id = "abc123",
+            top_k = 40,
+            min_p = 0.05,
+            repetition_penalty = 1.1,
+            frequency_penalty = 0.4,
+        )
+
+        body = _build_openai_upstream_body(
+            req,
+            "meta/llama-3.1-8b-instruct",
+        )
+
+        assert body["model"] == "meta/llama-3.1-8b-instruct"
+        assert body["messages"] == [{"role": "user", "content": "hello"}]
+        assert "enable_tools" not in body
+        assert "enabled_tools" not in body
+        assert "session_id" not in body
+        assert "top_k" not in body
+        assert "min_p" not in body
+        assert "repetition_penalty" not in body
+        assert body.get("frequency_penalty") == 0.4
+
+    def test_wiki_llm_available_true_with_upstream_only(self, monkeypatch):
+        class _DummyLlama:
+            is_loaded = False
+
+        class _DummyBackend:
+            active_model_name = None
+
+        monkeypatch.setattr(
+            inference_routes,
+            "get_llama_cpp_backend",
+            lambda: _DummyLlama(),
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "get_inference_backend",
+            lambda: _DummyBackend(),
+        )
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+
+        assert _wiki_llm_available() is True
+
+    def test_completions_fallback_toggle_defaults_to_enabled(self, monkeypatch):
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK",
+            True,
+        )
+        assert _llm_upstream_completions_fallback_enabled() is True
+
+    def test_completions_fallback_toggle_respects_disable(self, monkeypatch):
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK",
+            False,
+        )
+        assert _llm_upstream_completions_fallback_enabled() is False
+
+    def test_embeddings_fallback_toggle_defaults_to_disabled(self, monkeypatch):
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK",
+            False,
+        )
+        assert _llm_upstream_embeddings_fallback_enabled() is False
+
+    def test_embeddings_fallback_toggle_can_be_enabled(self, monkeypatch):
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK",
+            True,
+        )
+        assert _llm_upstream_embeddings_fallback_enabled() is True
 
 
 # =====================================================================

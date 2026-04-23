@@ -168,7 +168,11 @@ async def lifespan(app: FastAPI):
             from core.wiki.ingestor import WikiIngestor
             from core.wiki.watcher import WikiIngestionWatcher
             from core.inference import get_inference_backend
-            from routes.inference import get_llama_cpp_backend, _route_wiki_llm_stub
+            from routes.inference import (
+                get_llama_cpp_backend,
+                _route_wiki_llm_stub,
+                _llm_upstream_enabled,
+            )
 
             vault_root = Path(os.getenv("UNSLOTH_WIKI_VAULT", "/tmp/unsloth_wiki"))
             raw_dir = vault_root / "raw"
@@ -194,6 +198,8 @@ async def lifespan(app: FastAPI):
                         return True
                 except Exception:
                     pass
+                if _llm_upstream_enabled():
+                    return True
                 try:
                     backend = get_inference_backend()
                     return bool(getattr(backend, "active_model_name", None))

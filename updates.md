@@ -699,3 +699,74 @@ Addressed two correctness issues raised in automated review:
 Added regression tests:
 - `studio/backend/tests/test_wiki_archive_stale.py`
 - `studio/backend/tests/test_wiki_watcher.py::test_watcher_start_schedules_raw_dir_recursively`
+
+## April 2026 Addendum (NVIDIA/OpenAI Upstream Adapter Branch)
+
+This pass adds an env-driven OpenAI-compatible upstream mode so Studio can serve chat/wiki flows without loading a local GGUF or transformers model.
+
+### Additional changed files
+- `studio/backend/main.py`
+- `studio/backend/routes/inference.py`
+- `studio/backend/tests/test_openai_tool_passthrough.py`
+- `updates.md`
+
+### 1) Route-level upstream mode for chat + wiki LLM calls
+New env knobs in `studio/backend/routes/inference.py`:
+- `UNSLOTH_LLM_UPSTREAM_BASE_URL`
+- `UNSLOTH_LLM_UPSTREAM_API_KEY`
+- `UNSLOTH_LLM_UPSTREAM_MODEL`
+- `UNSLOTH_LLM_UPSTREAM_TIMEOUT_SECONDS` (default: `600`)
+
+Behavior:
+- `POST /v1/chat/completions` now falls back to upstream OpenAI-compatible chat when no local model is active.
+- Wiki route LLM stub now also falls back to upstream for extraction/maintenance prompts if local backends are unavailable.
+- `GET /v1/models` now attempts upstream model listing (`/models`) and merges those IDs with local model IDs.
+
+### 2) Watcher auto-analysis availability now recognizes upstream mode
+In `studio/backend/main.py`, watcher startup `llm_available_fn` now returns true if upstream mode is configured, so background wiki auto-analysis is not blocked by lack of a local loaded model.
+
+### 3) Optional upstream fallback for `/v1/completions`
+New toggle:
+- `UNSLOTH_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK` (default: `true`)
+
+Behavior:
+- If GGUF is not loaded and upstream is configured, `/v1/completions` proxies upstream.
+- Streaming and non-streaming both supported through the same upstream passthrough.
+
+### 4) Optional upstream fallback for `/v1/embeddings` (disabled by default)
+New toggle:
+- `UNSLOTH_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK` (default: `false`)
+
+Why default is `false`:
+- embedding dimensions, pooling behavior, and model compatibility can differ across providers.
+- clients often assume a stable vector shape and model identity for persistence/retrieval stores.
+
+When to enable:
+- only after selecting and pinning a specific upstream embedding model and confirming downstream vector-store dimensional compatibility.
+
+### 5) NVIDIA endpoint note from trial run
+Observed with provided API key:
+- `https://nim.api.nvidia.com/v1` returned `403` on `/models` and `404` for attempted model IDs.
+- `https://integrate.api.nvidia.com/v1` worked for both `/models` and chat completions.
+
+Recommended initial upstream env baseline:
+```bash
+UNSLOTH_LLM_UPSTREAM_BASE_URL=https://integrate.api.nvidia.com/v1
+UNSLOTH_LLM_UPSTREAM_API_KEY=${NVIDIA_API_KEY}
+UNSLOTH_LLM_UPSTREAM_MODEL=meta/llama-3.1-8b-instruct
+UNSLOTH_LLM_UPSTREAM_TIMEOUT_SECONDS=600
+
+# Optional endpoint fallbacks
+UNSLOTH_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK=true
+UNSLOTH_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK=false
+```
+
+### 6) Validation status
+Focused tests currently passing on this branch:
+```bash
+/Users/zohairshafi/Local\ Workspace/unsloth/.venv/bin/python -m pytest -q studio/backend/tests/test_openai_tool_passthrough.py
+# 62 passed
+
+/Users/zohairshafi/Local\ Workspace/unsloth/.venv/bin/python -m pytest -q studio/backend/tests/test_wiki_rag_pipeline.py
+# 48 passed
+```
