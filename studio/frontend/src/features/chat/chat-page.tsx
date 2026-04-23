@@ -560,6 +560,14 @@ export function ChatPage(): ReactElement {
       },
     ) => {
       const store = useChatRuntimeStore.getState();
+      if (store.useUpstream) {
+        toast.info("Upstream mode is enabled", {
+          description:
+            "Disable 'Use upstream backend' in Configuration to load a local model.",
+          duration: 3000,
+        });
+        return;
+      }
       const currentCheckpoint = store.params.checkpoint;
       const currentVariant = store.activeGgufVariant;
       if (

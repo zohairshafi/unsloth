@@ -729,6 +729,7 @@ Behavior when enabled:
 - chat auto-load logic no longer selects/loads the smallest local model when no checkpoint is set
 - title-generation calls also use upstream routing
 - compare composer skips explicit local load-before-generate and uses upstream-routed chat calls
+- top-bar model selector blocks local load attempts until upstream mode is disabled
 
 ### 3) Upstream routing safety
 If `use_upstream=true` is requested but upstream env is not configured, backend returns a clear 503 with configuration guidance.
