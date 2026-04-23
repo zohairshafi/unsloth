@@ -166,6 +166,7 @@ export interface OpenAIChatCompletionsRequest {
   image_base64?: string;
   audio_base64?: string;
   use_adapter?: boolean | string | null;
+  use_upstream?: boolean | null;
   enable_thinking?: boolean | null;
   enable_tools?: boolean | null;
   enabled_tools?: string[];

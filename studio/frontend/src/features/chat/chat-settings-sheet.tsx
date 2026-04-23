@@ -498,6 +498,8 @@ export function ChatSettingsPanel({
     (s) => s.loadedSpeculativeType,
   );
   const currentModels = useChatRuntimeStore((s) => s.models);
+  const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
+  const setUseUpstream = useChatRuntimeStore((s) => s.setUseUpstream);
   const modelRequiresTrustRemoteCode = useChatRuntimeStore(
     (s) => s.modelRequiresTrustRemoteCode,
   );
@@ -924,6 +926,30 @@ export function ChatSettingsPanel({
           defaultOpen={true}
         >
           <div className="flex flex-col gap-3 py-1">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-xs font-medium">Use upstream backend</div>
+                <div className="text-[11px] text-muted-foreground">
+                  Route chat requests to configured
+                  UNSLOTH_LLM_UPSTREAM_* endpoints instead of local inference.
+                </div>
+              </div>
+              <Switch checked={useUpstream} onCheckedChange={setUseUpstream} />
+            </div>
+
+            {useUpstream && (
+              <Alert className="border-primary/30 bg-primary/5 px-3 py-2 text-primary dark:border-primary/45 dark:bg-primary/10">
+                <AlertTitle className="text-[11px] font-medium">
+                  Upstream mode is enabled
+                </AlertTitle>
+                <AlertDescription className="text-[11px] text-primary/90 dark:text-primary/85">
+                  Chat sends use upstream routing and skip local auto-load.
+                  Ensure backend env vars are set: UNSLOTH_LLM_UPSTREAM_BASE_URL
+                  and UNSLOTH_LLM_UPSTREAM_API_KEY.
+                </AlertDescription>
+              </Alert>
+            )}
+
             {isGguf && (
               <>
                 <div className="space-y-2">

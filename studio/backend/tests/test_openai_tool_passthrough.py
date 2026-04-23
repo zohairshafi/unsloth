@@ -460,6 +460,7 @@ class TestOpenAIUpstreamHelpers:
             model = "default",
             messages = [{"role": "user", "content": "hello"}],
             stream = False,
+            use_upstream = True,
             enable_tools = True,
             enabled_tools = ["python"],
             session_id = "abc123",
@@ -479,6 +480,7 @@ class TestOpenAIUpstreamHelpers:
         assert "enable_tools" not in body
         assert "enabled_tools" not in body
         assert "session_id" not in body
+        assert "use_upstream" not in body
         assert "top_k" not in body
         assert "min_p" not in body
         assert "repetition_penalty" not in body

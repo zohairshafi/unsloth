@@ -266,8 +266,10 @@ function extractTextParts(m: ThreadMessage | undefined): string {
 async function generateTitleWithModel(payload: {
   userText: string;
 }): Promise<string | null> {
-  const params = useChatRuntimeStore.getState().params;
-  if (!params.checkpoint) return null;
+  const store = useChatRuntimeStore.getState();
+  const params = store.params;
+  const useUpstream = store.useUpstream;
+  if (!params.checkpoint && !useUpstream) return null;
 
   const user = clip(payload.userText, 256);
   const parts: string[] = [user];
@@ -295,13 +297,14 @@ async function generateTitleWithModel(payload: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: params.checkpoint,
+      model: useUpstream ? "default" : params.checkpoint,
       stream: false,
       temperature: 0.2,
       top_p: 0.9,
       max_tokens: 24,
       top_k: 20,
       repetition_penalty: 1.0,
+      ...(useUpstream ? { use_upstream: true } : {}),
       messages: [
         {
           role: "system",

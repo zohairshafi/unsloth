@@ -546,7 +546,8 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         await waitForModelReady(abortSignal);
       }
 
-      if (!useChatRuntimeStore.getState().params.checkpoint) {
+      const storeBeforeLoad = useChatRuntimeStore.getState();
+      if (!storeBeforeLoad.params.checkpoint && !storeBeforeLoad.useUpstream) {
         // Auto-load the smallest downloaded model
         const { loaded, blockedByTrustRemoteCode } =
           await autoLoadSmallestModel();
@@ -568,6 +569,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       // Re-read store after potential auto-load / model ready wait
       runtime = useChatRuntimeStore.getState();
       const { params } = runtime;
+      const useUpstream = runtime.useUpstream;
       const {
         supportsTools,
         toolsEnabled,
@@ -605,7 +607,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       const activeModel = runtime.models.find(
         (m) => m.id === params.checkpoint,
       );
-      if (activeModel?.isAudio && !activeModel?.hasAudioInput) {
+      if (!useUpstream && activeModel?.isAudio && !activeModel?.hasAudioInput) {
         const threadKey = resolvedThreadId || "__default";
         runtime.setThreadRunning(threadKey, true);
         try {
@@ -699,7 +701,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         const { supportsReasoning, reasoningEnabled } = runtime;
         const stream = streamChatCompletions(
           {
-            model: params.checkpoint,
+            model: useUpstream ? "default" : (params.checkpoint || "default"),
             messages: outboundMessages,
             stream: true,
             temperature: params.temperature,
@@ -711,6 +713,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             presence_penalty: params.presencePenalty,
             image_base64: imageBase64,
             audio_base64: audioBase64,
+            ...(useUpstream ? { use_upstream: true } : {}),
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
             ...(supportsReasoning ? { enable_thinking: reasoningEnabled } : {}),
             ...(supportsTools && (toolsEnabled || codeToolsEnabled)

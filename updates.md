@@ -700,6 +700,48 @@ Added regression tests:
 - `studio/backend/tests/test_wiki_archive_stale.py`
 - `studio/backend/tests/test_wiki_watcher.py::test_watcher_start_schedules_raw_dir_recursively`
 
+## April 2026 Addendum (UI Upstream Force Mode)
+
+This pass closes a UX gap where Chat auto-loaded a local model even when upstream env vars were configured.
+
+### Additional changed files
+- `studio/backend/models/inference.py`
+- `studio/backend/routes/inference.py`
+- `studio/backend/tests/test_openai_tool_passthrough.py`
+- `studio/frontend/src/features/chat/stores/chat-runtime-store.ts`
+- `studio/frontend/src/features/chat/chat-settings-sheet.tsx`
+- `studio/frontend/src/features/chat/api/chat-adapter.ts`
+- `studio/frontend/src/features/chat/runtime-provider.tsx`
+- `studio/frontend/src/features/chat/types/api.ts`
+- `updates.md`
+
+### 1) New chat request flag: `use_upstream`
+`ChatCompletionRequest` now accepts:
+- `use_upstream: bool` (`x-unsloth` extension)
+
+When true, `/v1/chat/completions` routes directly to configured upstream OpenAI backend and bypasses local GGUF/transformers backends, even if a local model is loaded.
+
+### 2) New Chat Settings toggle: "Use upstream backend"
+Added a persistent UI toggle in Chat Configuration -> Model.
+
+Behavior when enabled:
+- chat requests include `use_upstream: true`
+- chat auto-load logic no longer selects/loads the smallest local model when no checkpoint is set
+- title-generation calls also use upstream routing
+
+### 3) Upstream routing safety
+If `use_upstream=true` is requested but upstream env is not configured, backend returns a clear 503 with configuration guidance.
+
+### 4) Verification status
+Validated on this branch:
+```bash
+/Users/zohairshafi/Local\ Workspace/unsloth/.venv/bin/python -m pytest -q studio/backend/tests/test_openai_tool_passthrough.py
+# 62 passed
+
+cd studio/frontend && npm run typecheck
+# success
+```
+
 ## April 2026 Addendum (NVIDIA/OpenAI Upstream Adapter Branch)
 
 This pass adds an env-driven OpenAI-compatible upstream mode so Studio can serve chat/wiki flows without loading a local GGUF or transformers model.

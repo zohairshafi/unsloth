@@ -505,6 +505,13 @@ class ChatCompletionRequest(BaseModel):
             "string = enable a specific adapter by name."
         ),
     )
+    use_upstream: Optional[bool] = Field(
+        None,
+        description = (
+            "[x-unsloth] Force routing this request to the configured upstream "
+            "OpenAI-compatible backend, bypassing local loaded backends."
+        ),
+    )
     enable_thinking: Optional[bool] = Field(
         None,
         description = "[x-unsloth] Enable/disable thinking/reasoning mode for supported models",

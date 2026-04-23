@@ -11,6 +11,7 @@ import {
 } from "../types/runtime";
 
 const AUTO_TITLE_KEY = "unsloth_chat_auto_title";
+const USE_UPSTREAM_KEY = "unsloth_chat_use_upstream";
 const AUTO_HEAL_TOOL_CALLS_KEY = "unsloth_auto_heal_tool_calls";
 const MAX_TOOL_CALLS_KEY = "unsloth_max_tool_calls_per_message";
 const TOOL_CALL_TIMEOUT_KEY = "unsloth_tool_call_timeout";
@@ -148,6 +149,7 @@ type ChatRuntimeStore = {
   runningByThreadId: Record<string, boolean>;
   cancelByThreadId: Record<string, () => void>;
   autoTitle: boolean;
+  useUpstream: boolean;
   hfToken: string;
   modelsError: string | null;
   activeGgufVariant: string | null;
@@ -193,6 +195,7 @@ type ChatRuntimeStore = {
   registerThreadCancel: (threadId: string, cancel: () => void) => void;
   clearThreadCancel: (threadId: string) => void;
   setAutoTitle: (enabled: boolean) => void;
+  setUseUpstream: (enabled: boolean) => void;
   setHfToken: (token: string) => void;
   setModelsError: (error: string | null) => void;
   setCheckpoint: (modelId: string, ggufVariant?: string | null) => void;
@@ -223,6 +226,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   runningByThreadId: {},
   cancelByThreadId: {},
   autoTitle: loadBool(AUTO_TITLE_KEY, false),
+  useUpstream: loadBool(USE_UPSTREAM_KEY, false),
   hfToken: loadString(HF_TOKEN_KEY, ""),
   modelsError: null,
   activeGgufVariant: null,
@@ -298,6 +302,11 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
     set(() => {
       saveBool(AUTO_TITLE_KEY, autoTitle);
       return { autoTitle };
+    }),
+  setUseUpstream: (useUpstream) =>
+    set(() => {
+      saveBool(USE_UPSTREAM_KEY, useUpstream);
+      return { useUpstream };
     }),
   setHfToken: (hfToken) =>
     set(() => {

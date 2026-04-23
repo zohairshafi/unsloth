@@ -322,6 +322,7 @@ _UNSLOTH_ONLY_OPENAI_FIELDS = {
     "image_base64",
     "audio_base64",
     "use_adapter",
+    "use_upstream",
     "enable_thinking",
     "enable_tools",
     "enabled_tools",
@@ -2537,6 +2538,28 @@ async def openai_chat_completions(
     """
     llama_backend = get_llama_cpp_backend()
     using_gguf = llama_backend.is_loaded
+
+    if payload.use_upstream:
+        if not _llm_upstream_enabled():
+            raise HTTPException(
+                status_code = status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail = (
+                    "Upstream routing requested, but UNSLOTH_LLM_UPSTREAM_BASE_URL "
+                    "and UNSLOTH_LLM_UPSTREAM_API_KEY are not configured."
+                ),
+            )
+
+        upstream_model = _resolve_llm_upstream_model(payload.model)
+        if payload.stream:
+            return await _openai_upstream_chat_stream(
+                request,
+                payload,
+                upstream_model,
+            )
+        return await _openai_upstream_chat_non_streaming(
+            payload,
+            upstream_model,
+        )
 
     # ── Determine which backend is active ─────────────────────
     if using_gguf:
