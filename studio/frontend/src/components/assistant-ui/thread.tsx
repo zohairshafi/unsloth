@@ -195,10 +195,10 @@ const SuggestionItem: FC = () => {
       onClick={() => {
         if (!isDisabled && !isRunning) {
           const store = useChatRuntimeStore.getState();
-          if (store.supportsReasoning) {
+          if (store.supportsReasoning || store.useUpstream) {
             store.setReasoningEnabled(tools.includes("thinking"));
           }
-          if (store.supportsTools) {
+          if (store.supportsTools || store.useUpstream) {
             store.setToolsEnabled(tools.includes("search"));
             store.setCodeToolsEnabled(tools.includes("code"));
           }
@@ -392,10 +392,12 @@ const ReasoningToggle: FC = () => {
   const modelLoaded = useChatRuntimeStore(
     (s) => !!s.params.checkpoint && !s.modelLoading,
   );
+  const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
   const supportsReasoning = useChatRuntimeStore((s) => s.supportsReasoning);
   const reasoningEnabled = useChatRuntimeStore((s) => s.reasoningEnabled);
   const setReasoningEnabled = useChatRuntimeStore((s) => s.setReasoningEnabled);
-  const disabled = !modelLoaded || !supportsReasoning;
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled = !controlsReady || (!useUpstream && !supportsReasoning);
 
   return (
     <button
@@ -430,10 +432,12 @@ const WebSearchToggle: FC = () => {
   const modelLoaded = useChatRuntimeStore(
     (s) => !!s.params.checkpoint && !s.modelLoading,
   );
+  const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
   const supportsTools = useChatRuntimeStore((s) => s.supportsTools);
   const toolsEnabled = useChatRuntimeStore((s) => s.toolsEnabled);
   const setToolsEnabled = useChatRuntimeStore((s) => s.setToolsEnabled);
-  const disabled = !modelLoaded || !supportsTools;
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled = !controlsReady || (!useUpstream && !supportsTools);
 
   return (
     <button
@@ -460,12 +464,14 @@ const CodeToolsToggle: FC = () => {
   const modelLoaded = useChatRuntimeStore(
     (s) => !!s.params.checkpoint && !s.modelLoading,
   );
+  const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
   const supportsTools = useChatRuntimeStore((s) => s.supportsTools);
   const codeToolsEnabled = useChatRuntimeStore((s) => s.codeToolsEnabled);
   const setCodeToolsEnabled = useChatRuntimeStore(
     (s) => s.setCodeToolsEnabled,
   );
-  const disabled = !modelLoaded || !supportsTools;
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled = !controlsReady || (!useUpstream && !supportsTools);
 
   return (
     <button

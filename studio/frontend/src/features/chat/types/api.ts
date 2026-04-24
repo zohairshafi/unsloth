@@ -167,6 +167,7 @@ export interface OpenAIChatCompletionsRequest {
   audio_base64?: string;
   use_adapter?: boolean | string | null;
   use_upstream?: boolean | null;
+  upstream_auto_stream_fallback?: boolean | null;
   enable_thinking?: boolean | null;
   enable_tools?: boolean | null;
   enabled_tools?: string[];

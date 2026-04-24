@@ -45,6 +45,10 @@ from routes.inference import (
     _looks_like_history_intent,
     _normalize_openai_base_url,
     _resolve_llm_upstream_model,
+    _upstream_empty_assistant_fallback,
+    _upstream_builtin_tools_for_payload,
+    _upstream_server_tools_enabled,
+    _upstream_tool_use_nudge,
     _wiki_llm_available,
 )
 
@@ -461,6 +465,7 @@ class TestOpenAIUpstreamHelpers:
             messages = [{"role": "user", "content": "hello"}],
             stream = False,
             use_upstream = True,
+            upstream_auto_stream_fallback = True,
             enable_tools = True,
             enabled_tools = ["python"],
             session_id = "abc123",
@@ -481,10 +486,90 @@ class TestOpenAIUpstreamHelpers:
         assert "enabled_tools" not in body
         assert "session_id" not in body
         assert "use_upstream" not in body
+        assert "upstream_auto_stream_fallback" not in body
         assert "top_k" not in body
         assert "min_p" not in body
         assert "repetition_penalty" not in body
         assert body.get("frequency_penalty") == 0.4
+
+    def test_build_openai_upstream_body_forwards_thinking_for_nim_auto(self, monkeypatch):
+        monkeypatch.setattr(inference_routes, "_LLM_UPSTREAM_FORWARD_THINKING", "auto")
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_BASE_URL",
+            "https://integrate.api.nvidia.com/v1",
+        )
+
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hello"}],
+            stream = False,
+            enable_thinking = True,
+            chat_template_kwargs = {"existing": "ok"},
+        )
+
+        body = _build_openai_upstream_body(req, "google/gemma-4-31b-it")
+
+        assert body.get("chat_template_kwargs") == {
+            "existing": "ok",
+            "enable_thinking": True,
+        }
+
+    def test_upstream_tool_nudge_skips_tools_for_greetings(self):
+        nudge = _upstream_tool_use_nudge(
+            "meta/llama-3.3-70b-instruct",
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "web_search"},
+                }
+            ],
+        )
+        assert "greetings" in nudge.lower()
+        assert "respond directly without tools" in nudge.lower()
+
+    def test_upstream_empty_assistant_fallback_includes_last_tool_output(self):
+        fallback = _upstream_empty_assistant_fallback(
+            "web_search",
+            "Title: Example\nSnippet: hello world",
+        )
+        assert "calling web_search" in fallback.lower()
+        assert "hello world" in fallback
+
+    def test_upstream_empty_assistant_fallback_generic_message(self):
+        fallback = _upstream_empty_assistant_fallback("", "")
+        assert "could not generate a final answer" in fallback.lower()
+
+    def test_upstream_builtin_tools_respects_enabled_tools(self):
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hello"}],
+            stream = True,
+            enable_tools = True,
+            enabled_tools = ["python"],
+        )
+        tools = _upstream_builtin_tools_for_payload(req)
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert names == ["python"]
+
+    def test_upstream_server_tools_enabled_with_default_iterations(self):
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hello"}],
+            stream = True,
+            enable_tools = True,
+        )
+        assert _upstream_server_tools_enabled(req) is True
+
+    def test_upstream_server_tools_disabled_when_iterations_zero(self):
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hello"}],
+            stream = True,
+            enable_tools = True,
+            max_tool_calls_per_message = 0,
+        )
+        assert _upstream_server_tools_enabled(req) is False
 
     def test_wiki_llm_available_true_with_upstream_only(self, monkeypatch):
         class _DummyLlama:

@@ -12,6 +12,7 @@ import {
 
 const AUTO_TITLE_KEY = "unsloth_chat_auto_title";
 const USE_UPSTREAM_KEY = "unsloth_chat_use_upstream";
+const UPSTREAM_AUTO_STREAM_FALLBACK_KEY = "unsloth_upstream_auto_stream_fallback";
 const AUTO_HEAL_TOOL_CALLS_KEY = "unsloth_auto_heal_tool_calls";
 const MAX_TOOL_CALLS_KEY = "unsloth_max_tool_calls_per_message";
 const TOOL_CALL_TIMEOUT_KEY = "unsloth_tool_call_timeout";
@@ -150,6 +151,7 @@ type ChatRuntimeStore = {
   cancelByThreadId: Record<string, () => void>;
   autoTitle: boolean;
   useUpstream: boolean;
+  upstreamAutoStreamFallback: boolean;
   hfToken: string;
   modelsError: string | null;
   activeGgufVariant: string | null;
@@ -196,6 +198,7 @@ type ChatRuntimeStore = {
   clearThreadCancel: (threadId: string) => void;
   setAutoTitle: (enabled: boolean) => void;
   setUseUpstream: (enabled: boolean) => void;
+  setUpstreamAutoStreamFallback: (enabled: boolean) => void;
   setHfToken: (token: string) => void;
   setModelsError: (error: string | null) => void;
   setCheckpoint: (modelId: string, ggufVariant?: string | null) => void;
@@ -219,6 +222,8 @@ type ChatRuntimeStore = {
   setContextUsage: (usage: ChatRuntimeStore["contextUsage"]) => void;
 };
 
+const initialUseUpstream = loadBool(USE_UPSTREAM_KEY, false);
+
 export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   params: loadInferenceParams(),
   models: [],
@@ -226,7 +231,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   runningByThreadId: {},
   cancelByThreadId: {},
   autoTitle: loadBool(AUTO_TITLE_KEY, false),
-  useUpstream: loadBool(USE_UPSTREAM_KEY, false),
+  useUpstream: initialUseUpstream,
+  upstreamAutoStreamFallback: loadBool(UPSTREAM_AUTO_STREAM_FALLBACK_KEY, true),
   hfToken: loadString(HF_TOKEN_KEY, ""),
   modelsError: null,
   activeGgufVariant: null,
@@ -238,8 +244,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   reasoningAlwaysOn: false,
   reasoningEnabled: true,
   supportsTools: false,
-  toolsEnabled: false,
-  codeToolsEnabled: false,
+  toolsEnabled: initialUseUpstream,
+  codeToolsEnabled: initialUseUpstream,
   toolStatus: null,
   generatingStatus: null,
   autoHealToolCalls: loadBool(AUTO_HEAL_TOOL_CALLS_KEY, true),
@@ -306,7 +312,20 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   setUseUpstream: (useUpstream) =>
     set(() => {
       saveBool(USE_UPSTREAM_KEY, useUpstream);
+      if (useUpstream) {
+        return {
+          useUpstream,
+          reasoningEnabled: true,
+          toolsEnabled: true,
+          codeToolsEnabled: true,
+        };
+      }
       return { useUpstream };
+    }),
+  setUpstreamAutoStreamFallback: (upstreamAutoStreamFallback) =>
+    set(() => {
+      saveBool(UPSTREAM_AUTO_STREAM_FALLBACK_KEY, upstreamAutoStreamFallback);
+      return { upstreamAutoStreamFallback };
     }),
   setHfToken: (hfToken) =>
     set(() => {

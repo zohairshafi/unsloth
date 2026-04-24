@@ -30,6 +30,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useAnimatedThemeToggle } from "@/components/ui/animated-theme-toggler";
 import { cn } from "@/lib/utils";
+import { authFetch } from "@/features/auth";
 import {
   Book03Icon,
   ChefHatIcon,
@@ -70,8 +71,65 @@ import { ChatSearchDialog } from "@/features/chat/components/chat-search-dialog"
 import { useTrainingHistorySidebarItems, deleteTrainingRun } from "@/features/training";
 import type { TrainingRunSummary } from "@/features/training";
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
 import { ShutdownDialog } from "@/components/shutdown-dialog";
 import { removeTrainingUnloadGuard } from "@/features/training/hooks/use-training-unload-guard";
+
+type WikiLintApiResponse = {
+  status: string;
+  orphans: unknown[];
+  stale_pages: unknown[];
+  broken_links: unknown[];
+  missing_concepts: unknown[];
+  low_coverage_sources: unknown[];
+  total_pages: number;
+};
+
+type WikiMaintenanceApiResponse = {
+  status: string;
+  dry_run: boolean;
+  planned_merges: number;
+  applied_merges: number;
+  rewritten_pages: number;
+  rewritten_links: number;
+  errors: string[];
+};
+
+function parseApiError(status: number, body: unknown): string {
+  if (body && typeof body === "object" && "detail" in body) {
+    const detail = (body as { detail?: unknown }).detail;
+    if (typeof detail === "string") {
+      return detail;
+    }
+    if (Array.isArray(detail) && detail.length > 0) {
+      const first = detail[0];
+      if (typeof first === "string") {
+        return first;
+      }
+      if (first && typeof first === "object") {
+        const typed = first as { msg?: unknown; loc?: unknown };
+        const msg = typeof typed.msg === "string" ? typed.msg : null;
+        const loc = Array.isArray(typed.loc)
+          ? typed.loc
+              .map((segment) =>
+                typeof segment === "string" || typeof segment === "number"
+                  ? String(segment)
+                  : "",
+              )
+              .filter(Boolean)
+              .join(".")
+          : "";
+        if (msg && loc) {
+          return `${loc}: ${msg}`;
+        }
+        if (msg) {
+          return msg;
+        }
+      }
+    }
+  }
+  return `Request failed (${status})`;
+}
 
 function getTourId(pathname: string): string | null {
   if (pathname.startsWith("/studio")) return "studio";
@@ -185,6 +243,8 @@ export function AppSidebar() {
   const isStudioRoute = pathname === "/studio" || pathname.startsWith("/studio/");
   const [chatOpen, setChatOpen] = useState(true);
   const [runsOpen, setRunsOpen] = useState(true);
+  const [wikiLintRunning, setWikiLintRunning] = useState(false);
+  const [wikiMaintenanceRunning, setWikiMaintenanceRunning] = useState(false);
 
   useEffect(() => { if (isChatRoute) setChatOpen(true); }, [isChatRoute]);
   useEffect(() => { if (isStudioRoute) setRunsOpen(true); }, [isStudioRoute]);
@@ -219,6 +279,65 @@ export function AppSidebar() {
         search: { new: view.newThreadNonce },
       });
     });
+  }
+
+  async function runWikiLint(): Promise<void> {
+    if (wikiLintRunning) return;
+    setWikiLintRunning(true);
+    try {
+      const response = await authFetch("/api/inference/wiki/lint");
+      const body = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(parseApiError(response.status, body));
+      }
+      const data = body as WikiLintApiResponse;
+      toast.success("Wiki lint complete", {
+        description:
+          `Pages ${data.total_pages} | ` +
+          `Broken links ${data.broken_links.length} | ` +
+          `Orphans ${data.orphans.length} | ` +
+          `Stale ${data.stale_pages.length}`,
+      });
+    } catch (error) {
+      toast.error("Wiki lint failed", {
+        description:
+          error instanceof Error ? error.message : "Unknown error",
+      });
+    } finally {
+      setWikiLintRunning(false);
+    }
+  }
+
+  async function runWikiMaintenance(): Promise<void> {
+    if (wikiMaintenanceRunning) return;
+    setWikiMaintenanceRunning(true);
+    try {
+      const response = await authFetch("/api/inference/wiki/merge-maintenance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dry_run: false }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(parseApiError(response.status, body));
+      }
+      const data = body as WikiMaintenanceApiResponse;
+      const errors = Array.isArray(data.errors) ? data.errors.length : 0;
+      toast.success("Wiki maintenance complete", {
+        description:
+          `Applied merges ${data.applied_merges} | ` +
+          `Rewritten pages ${data.rewritten_pages} | ` +
+          `Rewritten links ${data.rewritten_links}` +
+          (errors > 0 ? ` | Errors ${errors}` : ""),
+      });
+    } catch (error) {
+      toast.error("Wiki maintenance failed", {
+        description:
+          error instanceof Error ? error.message : "Unknown error",
+      });
+    } finally {
+      setWikiMaintenanceRunning(false);
+    }
   }
 
   return (
@@ -381,6 +500,26 @@ export function AppSidebar() {
                   if (chatOnly) return;
                   navigate({ to: "/export" });
                   closeMobileIfOpen();
+                }}
+              />
+
+              <NavItem
+                icon={Search01Icon}
+                label={wikiLintRunning ? "Linting..." : "Lint"}
+                active={wikiLintRunning}
+                disabled={wikiLintRunning}
+                onClick={() => {
+                  void runWikiLint();
+                }}
+              />
+
+              <NavItem
+                icon={ZapIcon}
+                label={wikiMaintenanceRunning ? "Maintaining..." : "Maintenance"}
+                active={wikiMaintenanceRunning}
+                disabled={wikiMaintenanceRunning}
+                onClick={() => {
+                  void runWikiMaintenance();
                 }}
               />
             </SidebarMenu>

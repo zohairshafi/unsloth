@@ -744,6 +744,38 @@ cd studio/frontend && npm run typecheck
 # success
 ```
 
+## April 2026 Addendum (Sidebar Wiki Actions)
+
+Added two quick actions in the main left sidebar (same section as Train / Recipes / Export):
+
+- `Lint`
+  - Calls `GET /api/inference/wiki/lint`
+  - Shows a summary toast with page totals, orphan count, stale count, and broken-link count.
+
+- `Maintenance`
+  - Calls `POST /api/inference/wiki/merge-maintenance` with `{"dry_run": false}`
+  - Shows a summary toast with applied merges and rewritten page/link counts.
+
+Both actions are authenticated with existing Studio auth headers and show descriptive error toasts on failure.
+
+Also added a model-picker option in Chat named `Upstream backend`.
+- Selecting it enables upstream mode immediately (`use_upstream` routing), so users can opt into env-configured upstream directly from the picker.
+
+## April 2026 Addendum (Upstream UX + 422 Hardening)
+
+Follow-up fixes after enabling upstream picker mode:
+
+- Think / Search / Code toggles are now usable in upstream mode (single-chat + compare composer).
+  - They no longer require a locally loaded model when upstream mode is active.
+  - Upstream requests now include the same toggle intent fields (`enable_thinking`, `enable_tools`, `enabled_tools`) at the Studio route boundary.
+
+- Sidebar `Lint` and `Maintenance` quick actions are no longer blocked by chat-only mode.
+  - They are disabled only while the action itself is in progress.
+
+- Reduced opaque `Request failed (422)` behavior:
+  - Frontend error parsing now extracts FastAPI/Pydantic validation details from array-style `detail` payloads.
+  - Outbound chat history normalization now avoids empty-content messages that can trigger backend 422 validation errors (for example multimodal turns with no text).
+
 ## April 2026 Addendum (NVIDIA/OpenAI Upstream Adapter Branch)
 
 This pass adds an env-driven OpenAI-compatible upstream mode so Studio can serve chat/wiki flows without loading a local GGUF or transformers model.
@@ -814,3 +846,8 @@ Focused tests currently passing on this branch:
 /Users/zohairshafi/Local\ Workspace/unsloth/.venv/bin/python -m pytest -q studio/backend/tests/test_wiki_rag_pipeline.py
 # 48 passed
 ```
+
+### Deferred hardening ideas (kept out of current PR scope)
+- Deterministic small-talk bypass for server-side tools (for example `hi`, `hello`) so tool loops are skipped on pure greetings.
+- Repeated-tool-loop breaker that stops identical tool calls after N attempts and forces a final answer.
+- These are intentionally deferred to reduce PR scope and review risk; revisit in a follow-up hardening PR if upstream tool-loop regressions reappear.

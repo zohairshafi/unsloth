@@ -17,13 +17,37 @@ import type {
 } from "../types/api";
 
 function parseErrorText(status: number, body: unknown): string {
-  if (
-    body &&
-    typeof body === "object" &&
-    "detail" in body &&
-    typeof body.detail === "string"
-  ) {
-    return body.detail;
+  if (body && typeof body === "object" && "detail" in body) {
+    const detail = (body as { detail?: unknown }).detail;
+    if (typeof detail === "string") {
+      return detail;
+    }
+    if (Array.isArray(detail) && detail.length > 0) {
+      const first = detail[0];
+      if (typeof first === "string") {
+        return first;
+      }
+      if (first && typeof first === "object") {
+        const typed = first as { msg?: unknown; loc?: unknown };
+        const msg = typeof typed.msg === "string" ? typed.msg : null;
+        const loc = Array.isArray(typed.loc)
+          ? typed.loc
+              .map((segment) =>
+                typeof segment === "string" || typeof segment === "number"
+                  ? String(segment)
+                  : "",
+              )
+              .filter(Boolean)
+              .join(".")
+          : "";
+        if (msg && loc) {
+          return `${loc}: ${msg}`;
+        }
+        if (msg) {
+          return msg;
+        }
+      }
+    }
   }
   if (
     body &&

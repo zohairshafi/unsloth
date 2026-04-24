@@ -512,6 +512,14 @@ class ChatCompletionRequest(BaseModel):
             "OpenAI-compatible backend, bypassing local loaded backends."
         ),
     )
+    upstream_auto_stream_fallback: Optional[bool] = Field(
+        None,
+        description = (
+            "[x-unsloth] When using upstream routing + streaming, "
+            "automatically retry as non-streaming if the stream fails before "
+            "the first token."
+        ),
+    )
     enable_thinking: Optional[bool] = Field(
         None,
         description = "[x-unsloth] Enable/disable thinking/reasoning mode for supported models",

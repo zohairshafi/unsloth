@@ -159,6 +159,35 @@ function collectTextParts(message: RunMessage): string[] {
   return textParts;
 }
 
+function hasMediaPart(
+  message: RunMessage,
+  mediaType: "image" | "audio",
+): boolean {
+  const messageParts = Array.isArray(message.content)
+    ? (message.content as Array<{ type?: string }>)
+    : [];
+  if (messageParts.some((part) => part.type === mediaType)) {
+    return true;
+  }
+
+  if (!("attachments" in message)) {
+    return false;
+  }
+
+  const attachments = Array.isArray(message.attachments)
+    ? message.attachments
+    : [];
+  for (const attachment of attachments) {
+    const parts = Array.isArray(attachment.content)
+      ? (attachment.content as Array<{ type?: string }>)
+      : [];
+    if (parts.some((part) => part.type === mediaType)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function toOpenAIMessage(message: RunMessage): {
   role: "system" | "user" | "assistant";
   content: string;
@@ -171,7 +200,27 @@ function toOpenAIMessage(message: RunMessage): {
     return null;
   }
 
-  let content = collectTextParts(message).join("\n");
+  let content = collectTextParts(message).join("\n").trim();
+
+  // Keep user turns schema-valid for multimodal-only messages.
+  // The backend requires non-empty user/system/assistant text content.
+  if (!content && message.role === "user") {
+    const hasImage = hasMediaPart(message, "image");
+    const hasAudio = hasMediaPart(message, "audio");
+    if (hasImage && hasAudio) {
+      content = "[image and audio attachment]";
+    } else if (hasImage) {
+      content = "[image attachment]";
+    } else if (hasAudio) {
+      content = "[audio attachment]";
+    }
+  }
+
+  if (!content) {
+    // Drop empty assistant/system entries so request validation doesn't fail.
+    return null;
+  }
+
   // Strip inline audio base64 from prior assistant messages to avoid
   // inflating token counts (e.g. audio-player responses with embedded WAV).
   if (message.role === "assistant") {
@@ -570,11 +619,14 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       runtime = useChatRuntimeStore.getState();
       const { params } = runtime;
       const useUpstream = runtime.useUpstream;
+      const upstreamAutoStreamFallback = runtime.upstreamAutoStreamFallback;
       const {
         supportsTools,
         toolsEnabled,
         codeToolsEnabled,
       } = runtime;
+      const reasoningCapable = runtime.supportsReasoning || useUpstream;
+      const toolCapable = supportsTools || useUpstream;
 
       const outboundMessages = messages
         .map(toOpenAIMessage)
@@ -713,10 +765,15 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             presence_penalty: params.presencePenalty,
             image_base64: imageBase64,
             audio_base64: audioBase64,
-            ...(useUpstream ? { use_upstream: true } : {}),
+            ...(useUpstream
+              ? {
+                  use_upstream: true,
+                  upstream_auto_stream_fallback: upstreamAutoStreamFallback,
+                }
+              : {}),
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
-            ...(supportsReasoning ? { enable_thinking: reasoningEnabled } : {}),
-            ...(supportsTools && (toolsEnabled || codeToolsEnabled)
+            ...(reasoningCapable ? { enable_thinking: reasoningEnabled } : {}),
+            ...(toolCapable && (toolsEnabled || codeToolsEnabled)
               ? {
                   enable_tools: true,
                   enabled_tools: [

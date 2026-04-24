@@ -60,6 +60,8 @@ type LoraCandidate = {
   exportType?: "lora" | "merged" | "gguf";
 };
 
+const UPSTREAM_MODEL_PICKER_ID = "__upstream_backend__";
+
 function normalizeModelRef(value: string | null | undefined): string {
   return value?.trim().toLowerCase() ?? "";
 }
@@ -497,6 +499,7 @@ export function ChatPage(): ReactElement {
   const viewBeforeCompareRef = useRef<ChatSearch | null>(null);
   const inferenceParams = useChatRuntimeStore((state) => state.params);
   const setInferenceParams = useChatRuntimeStore((state) => state.setParams);
+  const useUpstream = useChatRuntimeStore((state) => state.useUpstream);
   const activeGgufVariant = useChatRuntimeStore(
     (state) => state.activeGgufVariant,
   );
@@ -560,6 +563,17 @@ export function ChatPage(): ReactElement {
       },
     ) => {
       const store = useChatRuntimeStore.getState();
+      if (value === UPSTREAM_MODEL_PICKER_ID) {
+        if (!store.useUpstream) {
+          store.setUseUpstream(true);
+          toast.success("Upstream backend enabled", {
+            description:
+              "Chat requests now route through your configured upstream provider.",
+            duration: 3000,
+          });
+        }
+        return;
+      }
       if (store.useUpstream) {
         toast.info("Upstream mode is enabled", {
           description:
@@ -678,6 +692,18 @@ export function ChatPage(): ReactElement {
         isGguf: model.isGguf,
       })),
     [modelsFromStore],
+  );
+
+  const modelsWithUpstream = useMemo<ModelOption[]>(
+    () => [
+      {
+        id: UPSTREAM_MODEL_PICKER_ID,
+        name: "Upstream backend",
+        description: "Route through configured upstream API",
+      },
+      ...models,
+    ],
+    [models],
   );
 
   const [localModels, setLocalModels] = useState<LoraModelOption[]>([]);
@@ -848,12 +874,12 @@ export function ChatPage(): ReactElement {
           <div className="flex items-center gap-1">
             {view.mode !== "compare" && (
               <ModelSelector
-                models={models}
+                models={modelsWithUpstream}
                 loraModels={loraModels}
-                value={inferenceParams.checkpoint}
+                value={useUpstream ? UPSTREAM_MODEL_PICKER_ID : inferenceParams.checkpoint}
                 activeGgufVariant={activeGgufVariant}
                 onValueChange={handleCheckpointChange}
-                onEject={handleEject}
+                onEject={useUpstream ? undefined : handleEject}
                 onFoldersChange={refreshLocalModels}
                 variant="ghost"
                 open={modelSelectorOpen}

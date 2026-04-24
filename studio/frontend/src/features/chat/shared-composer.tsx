@@ -241,6 +241,7 @@ export function SharedComposer({
   const modelLoaded = useChatRuntimeStore(
     (s) => !!s.params.checkpoint && !s.modelLoading,
   );
+  const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
   const supportsReasoning = useChatRuntimeStore((s) => s.supportsReasoning);
   const reasoningAlwaysOn = useChatRuntimeStore((s) => s.reasoningAlwaysOn);
   const reasoningEnabled = useChatRuntimeStore((s) => s.reasoningEnabled);
@@ -250,8 +251,9 @@ export function SharedComposer({
   const setToolsEnabled = useChatRuntimeStore((s) => s.setToolsEnabled);
   const codeToolsEnabled = useChatRuntimeStore((s) => s.codeToolsEnabled);
   const setCodeToolsEnabled = useChatRuntimeStore((s) => s.setCodeToolsEnabled);
-  const reasoningDisabled = !modelLoaded || !supportsReasoning;
-  const toolsDisabled = !modelLoaded || !supportsTools;
+  const controlsReady = modelLoaded || useUpstream;
+  const reasoningDisabled = !controlsReady || (!useUpstream && !supportsReasoning);
+  const toolsDisabled = !controlsReady || (!useUpstream && !supportsTools);
   const setPendingAudioStore = useChatRuntimeStore((s) => s.setPendingAudio);
   const clearPendingAudioStore = useChatRuntimeStore((s) => s.clearPendingAudio);
 
@@ -339,8 +341,8 @@ export function SharedComposer({
     // Generalized compare: load each model before dispatching to its side
     const hasCompareHandles = Boolean(handlesRef.current["model1"] || handlesRef.current["model2"]);
     const isGeneralizedCompare = hasCompareHandles && Boolean(model1?.id || model2?.id);
-    const useUpstream = useChatRuntimeStore.getState().useUpstream;
-    if (isGeneralizedCompare && !useUpstream) {
+    const useUpstreamMode = useChatRuntimeStore.getState().useUpstream;
+    if (isGeneralizedCompare && !useUpstreamMode) {
       const store = useChatRuntimeStore.getState();
       const maxSeqLength = store.params.maxSeqLength;
       const trustRemoteCode = store.params.trustRemoteCode ?? false;

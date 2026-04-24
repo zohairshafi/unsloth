@@ -500,6 +500,12 @@ export function ChatSettingsPanel({
   const currentModels = useChatRuntimeStore((s) => s.models);
   const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
   const setUseUpstream = useChatRuntimeStore((s) => s.setUseUpstream);
+  const upstreamAutoStreamFallback = useChatRuntimeStore(
+    (s) => s.upstreamAutoStreamFallback,
+  );
+  const setUpstreamAutoStreamFallback = useChatRuntimeStore(
+    (s) => s.setUpstreamAutoStreamFallback,
+  );
   const modelRequiresTrustRemoteCode = useChatRuntimeStore(
     (s) => s.modelRequiresTrustRemoteCode,
   );
@@ -936,6 +942,24 @@ export function ChatSettingsPanel({
               </div>
               <Switch checked={useUpstream} onCheckedChange={setUseUpstream} />
             </div>
+
+            {useUpstream && (
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-medium">
+                    Auto fallback stream mode
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    If upstream streaming fails before first token, retry
+                    non-streaming and continue.
+                  </div>
+                </div>
+                <Switch
+                  checked={upstreamAutoStreamFallback}
+                  onCheckedChange={setUpstreamAutoStreamFallback}
+                />
+              </div>
+            )}
 
             {useUpstream && (
               <Alert className="border-primary/30 bg-primary/5 px-3 py-2 text-primary dark:border-primary/45 dark:bg-primary/10">
