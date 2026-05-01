@@ -627,9 +627,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       } = runtime;
       const reasoningCapable = runtime.supportsReasoning || useUpstream;
       const toolCapable = supportsTools || useUpstream;
-      const effectiveReasoningEnabled = useUpstream ? true : runtime.reasoningEnabled;
-      const effectiveToolsEnabled = useUpstream ? true : toolsEnabled;
-      const effectiveCodeToolsEnabled = useUpstream ? true : codeToolsEnabled;
+      const reasoningEnabled = runtime.reasoningEnabled;
 
       const outboundMessages = messages
         .map(toOpenAIMessage)
@@ -775,14 +773,14 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
               : {}),
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
             ...(reasoningCapable
-              ? { enable_thinking: effectiveReasoningEnabled }
+              ? { enable_thinking: reasoningEnabled }
               : {}),
-            ...(toolCapable && (effectiveToolsEnabled || effectiveCodeToolsEnabled)
+            ...(toolCapable && (toolsEnabled || codeToolsEnabled)
               ? {
                   enable_tools: true,
                   enabled_tools: [
-                    ...(effectiveToolsEnabled ? ["web_search"] : []),
-                    ...(effectiveCodeToolsEnabled ? ["python", "terminal"] : []),
+                    ...(toolsEnabled ? ["web_search"] : []),
+                    ...(codeToolsEnabled ? ["python", "terminal"] : []),
                   ],
                   auto_heal_tool_calls: useChatRuntimeStore.getState().autoHealToolCalls,
                   max_tool_calls_per_message: useChatRuntimeStore.getState().maxToolCallsPerMessage,
