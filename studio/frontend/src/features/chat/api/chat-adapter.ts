@@ -627,6 +627,9 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       } = runtime;
       const reasoningCapable = runtime.supportsReasoning || useUpstream;
       const toolCapable = supportsTools || useUpstream;
+      const effectiveReasoningEnabled = useUpstream ? true : runtime.reasoningEnabled;
+      const effectiveToolsEnabled = useUpstream ? true : toolsEnabled;
+      const effectiveCodeToolsEnabled = useUpstream ? true : codeToolsEnabled;
 
       const outboundMessages = messages
         .map(toOpenAIMessage)
@@ -750,7 +753,6 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       let serverMetadata: { usage?: ServerUsage; timings?: ServerTimings } | null = null;
 
       try {
-        const { supportsReasoning, reasoningEnabled } = runtime;
         const stream = streamChatCompletions(
           {
             model: useUpstream ? "default" : (params.checkpoint || "default"),
@@ -772,13 +774,15 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                 }
               : {}),
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
-            ...(reasoningCapable ? { enable_thinking: reasoningEnabled } : {}),
-            ...(toolCapable && (toolsEnabled || codeToolsEnabled)
+            ...(reasoningCapable
+              ? { enable_thinking: effectiveReasoningEnabled }
+              : {}),
+            ...(toolCapable && (effectiveToolsEnabled || effectiveCodeToolsEnabled)
               ? {
                   enable_tools: true,
                   enabled_tools: [
-                    ...(toolsEnabled ? ["web_search"] : []),
-                    ...(codeToolsEnabled ? ["python", "terminal"] : []),
+                    ...(effectiveToolsEnabled ? ["web_search"] : []),
+                    ...(effectiveCodeToolsEnabled ? ["python", "terminal"] : []),
                   ],
                   auto_heal_tool_calls: useChatRuntimeStore.getState().autoHealToolCalls,
                   max_tool_calls_per_message: useChatRuntimeStore.getState().maxToolCallsPerMessage,

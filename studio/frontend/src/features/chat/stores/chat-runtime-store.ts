@@ -369,9 +369,18 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       defaultChatTemplate: null,
       chatTemplateOverride: null,
     })),
-  setReasoningEnabled: (reasoningEnabled) => set({ reasoningEnabled }),
-  setToolsEnabled: (toolsEnabled) => set({ toolsEnabled }),
-  setCodeToolsEnabled: (codeToolsEnabled) => set({ codeToolsEnabled }),
+  setReasoningEnabled: (reasoningEnabled) =>
+    set((state) => ({
+      reasoningEnabled: state.useUpstream ? true : reasoningEnabled,
+    })),
+  setToolsEnabled: (toolsEnabled) =>
+    set((state) => ({
+      toolsEnabled: state.useUpstream ? true : toolsEnabled,
+    })),
+  setCodeToolsEnabled: (codeToolsEnabled) =>
+    set((state) => ({
+      codeToolsEnabled: state.useUpstream ? true : codeToolsEnabled,
+    })),
   setToolStatus: (toolStatus) => set({ toolStatus }),
   setGeneratingStatus: (generatingStatus) => set({ generatingStatus }),
   setAutoHealToolCalls: (autoHealToolCalls) =>

@@ -2693,6 +2693,30 @@ def _upstream_server_tools_enabled(payload: ChatCompletionRequest) -> bool:
     return max_iters > 0
 
 
+def _upstream_force_always_on_capabilities(
+    payload: ChatCompletionRequest,
+) -> ChatCompletionRequest:
+    """Ensure upstream requests always keep thinking and server-tools enabled."""
+    updates: dict[str, Any] = {}
+
+    if payload.enable_thinking is not True:
+        updates["enable_thinking"] = True
+    if payload.enable_tools is not True:
+        updates["enable_tools"] = True
+
+    max_iters = payload.max_tool_calls_per_message
+    if max_iters is None or max_iters <= 0:
+        updates["max_tool_calls_per_message"] = 25
+
+    # Empty enabled_tools disables all tools; treat it as "all tools" upstream.
+    if payload.enabled_tools is not None and len(payload.enabled_tools) == 0:
+        updates["enabled_tools"] = None
+
+    if not updates:
+        return payload
+    return payload.model_copy(update = updates)
+
+
 async def _openai_upstream_tool_loop_events(
     payload: ChatCompletionRequest,
     model_name: str,
@@ -3437,26 +3461,27 @@ async def openai_chat_completions(
                 ),
             )
 
-        upstream_model = _resolve_llm_upstream_model(payload.model)
-        if _upstream_server_tools_enabled(payload):
+        upstream_payload = _upstream_force_always_on_capabilities(payload)
+        upstream_model = _resolve_llm_upstream_model(upstream_payload.model)
+        if _upstream_server_tools_enabled(upstream_payload):
             if payload.stream:
                 return await _openai_upstream_chat_tools_stream(
                     request,
-                    payload,
+                    upstream_payload,
                     upstream_model,
                 )
             return await _openai_upstream_chat_tools_non_streaming(
-                payload,
+                upstream_payload,
                 upstream_model,
             )
         if payload.stream:
             return await _openai_upstream_chat_stream(
                 request,
-                payload,
+                upstream_payload,
                 upstream_model,
             )
         return await _openai_upstream_chat_non_streaming(
-            payload,
+            upstream_payload,
             upstream_model,
         )
 
@@ -3469,26 +3494,27 @@ async def openai_chat_completions(
         backend = get_inference_backend()
         if not backend.active_model_name:
             if _llm_upstream_enabled():
-                upstream_model = _resolve_llm_upstream_model(payload.model)
-                if _upstream_server_tools_enabled(payload):
+                upstream_payload = _upstream_force_always_on_capabilities(payload)
+                upstream_model = _resolve_llm_upstream_model(upstream_payload.model)
+                if _upstream_server_tools_enabled(upstream_payload):
                     if payload.stream:
                         return await _openai_upstream_chat_tools_stream(
                             request,
-                            payload,
+                            upstream_payload,
                             upstream_model,
                         )
                     return await _openai_upstream_chat_tools_non_streaming(
-                        payload,
+                        upstream_payload,
                         upstream_model,
                     )
                 if payload.stream:
                     return await _openai_upstream_chat_stream(
                         request,
-                        payload,
+                        upstream_payload,
                         upstream_model,
                     )
                 return await _openai_upstream_chat_non_streaming(
-                    payload,
+                    upstream_payload,
                     upstream_model,
                 )
             raise HTTPException(
