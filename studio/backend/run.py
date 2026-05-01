@@ -242,12 +242,16 @@ _server = None
 # Shutdown event -- used to wake the main loop on signal
 _shutdown_event = None
 
+# Restart flag -- when true the main loop boots a fresh server instance.
+_restart_requested = False
+
 
 def run_server(
     host: str = "0.0.0.0",
     port: int = 8888,
     frontend_path: Path = Path(__file__).resolve().parent.parent / "frontend" / "dist",
     silent: bool = False,
+    api_only: bool = False,
     wiki_watcher: bool | None = None,
     wiki_auto_query: bool | None = None,
     wiki_lint_every: int | None = None,
@@ -262,6 +266,7 @@ def run_server(
         port: Port to bind to (auto-increments if in use)
         frontend_path: Path to frontend build directory (optional)
         silent: Suppress startup messages
+        api_only: Run API server only, no frontend serving (for Tauri desktop app)
         llama_parallel_slots: Number of parallel slots for llama-server
 
     Note:
@@ -278,6 +283,10 @@ def run_server(
             sys.stdout.reconfigure(encoding = "utf-8", errors = "replace")
         except Exception:
             pass
+
+    # Set env var BEFORE importing main so CORS middleware picks it up
+    if api_only:
+        os.environ["UNSLOTH_API_ONLY"] = "1"
 
     import nest_asyncio
 
@@ -329,8 +338,12 @@ def run_server(
             print("=" * 50)
             print("")
 
-    # Setup frontend if path provided
-    if frontend_path:
+    # Output port for Tauri to parse when in api-only mode
+    if api_only:
+        print(f"TAURI_PORT={port}", flush = True)
+
+    # Setup frontend if path provided (skip in api-only mode)
+    if frontend_path and not api_only:
         if setup_frontend(app, frontend_path):
             if not silent:
                 print(f"[OK] Frontend loaded from {frontend_path}")
@@ -370,11 +383,21 @@ def run_server(
     # Expose a shutdown callable via app.state so the /api/shutdown endpoint
     # can trigger graceful shutdown without circular imports.
     def _trigger_shutdown():
+        global _restart_requested
+        _restart_requested = False
+        _graceful_shutdown(_server)
+        if _shutdown_event is not None:
+            _shutdown_event.set()
+
+    def _trigger_restart():
+        global _restart_requested
+        _restart_requested = True
         _graceful_shutdown(_server)
         if _shutdown_event is not None:
             _shutdown_event.set()
 
     app.state.trigger_shutdown = _trigger_shutdown
+    app.state.trigger_restart = _trigger_restart
 
     if not silent:
         display_host = _resolve_external_ip() if host == "0.0.0.0" else host
@@ -410,6 +433,11 @@ if __name__ == "__main__":
         help = "Path to frontend build",
     )
     parser.add_argument("--silent", action = "store_true", help = "Suppress output")
+    parser.add_argument(
+        "--api-only",
+        action = "store_true",
+        help = "Run API server only, no frontend serving (for Tauri desktop app)",
+    )
     watcher_group = parser.add_mutually_exclusive_group()
     watcher_group.add_argument(
         "--wiki-watcher",
@@ -469,6 +497,7 @@ if __name__ == "__main__":
         host = args.host,
         port = args.port,
         silent = args.silent,
+        api_only = args.api_only,
         wiki_watcher = args.wiki_watcher,
         wiki_auto_query = args.wiki_auto_query,
         wiki_lint_every = args.wiki_lint_every,
@@ -477,25 +506,13 @@ if __name__ == "__main__":
     if args.frontend is not None:
         kwargs["frontend_path"] = Path(args.frontend)
 
-    try:
-        run_server(**kwargs)
-    except Exception:
-        sys.stderr.write("\n")
-        sys.stderr.write("=" * 60 + "\n")
-        sys.stderr.write("ERROR: Unsloth Studio failed to start.\n")
-        sys.stderr.write("=" * 60 + "\n")
-        traceback.print_exc(file = sys.stderr)
-        sys.stderr.write("\n")
-        sys.stderr.write(
-            "If a package is missing, try re-running: unsloth studio setup\n"
-        )
-        sys.stderr.flush()
-        sys.exit(1)
-
     # Signal handler -- ensures subprocess cleanup on Ctrl+C
     def _signal_handler(signum, frame):
+        global _restart_requested
+        _restart_requested = False
         _graceful_shutdown(_server)
-        _shutdown_event.set()
+        if _shutdown_event is not None:
+            _shutdown_event.set()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -504,9 +521,31 @@ if __name__ == "__main__":
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
 
-    # Keep running until shutdown signal.
-    # NOTE: Event.wait() without a timeout blocks at the C level on Linux,
-    # which prevents Python from delivering SIGINT (Ctrl+C).  Using a
-    # short timeout in a loop lets the interpreter process pending signals.
-    while not _shutdown_event.is_set():
-        _shutdown_event.wait(timeout = 1)
+    while True:
+        try:
+            run_server(**kwargs)
+        except Exception:
+            sys.stderr.write("\n")
+            sys.stderr.write("=" * 60 + "\n")
+            sys.stderr.write("ERROR: Unsloth Studio failed to start.\n")
+            sys.stderr.write("=" * 60 + "\n")
+            traceback.print_exc(file = sys.stderr)
+            sys.stderr.write("\n")
+            sys.stderr.write(
+                "If a package is missing, try re-running: unsloth studio setup\n"
+            )
+            sys.stderr.flush()
+            sys.exit(1)
+
+        # Keep running until shutdown signal.
+        # NOTE: Event.wait() without a timeout blocks at the C level on Linux,
+        # which prevents Python from delivering SIGINT (Ctrl+C).  Using a
+        # short timeout in a loop lets the interpreter process pending signals.
+        while _shutdown_event is not None and not _shutdown_event.is_set():
+            _shutdown_event.wait(timeout = 1)
+
+        if _restart_requested:
+            logger.info("Backend restart requested -- launching fresh server instance")
+            _restart_requested = False
+            continue
+        break

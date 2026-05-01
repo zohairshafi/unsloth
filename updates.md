@@ -3,6 +3,67 @@
 ## Scope
 This document summarizes the backend RAG changes made to unblock end-to-end wiki retrieval for GGUF chat, and adds practical debugging and cleanup workflows.
 
+## Incremental Update (2026-04-30, diagnostics + logging)
+
+- Added rank-mode logging parity for transformer/safetensors RAG path (`studio/backend/core/inference/inference.py`), so logs now include `rank_mode`, selected pages, context chars, and query similar to GGUF route diagnostics.
+- Wiki `log.md` headings now include UTC hour:minute (`YYYY-MM-DD HH:MM`) instead of date-only headings.
+- Wiki behaviour UI parity audit completed: runtime env coverage is complete (68 variables, no uncategorized variables), and category rendering now preserves backend runtime-spec order within each category.
+- Chunked-ingest robustness improved for large sources: default chunk context window is now capped by extraction/query limits, propagated into per-chunk query context overrides, and auto-replanned to a smaller window when a large source still yields only one chunk.
+- Low-quality answer gating now catches shorter repeated-token degeneration runs earlier, reducing cases where repetitive gibberish slips through as `Answer Mode: llm`.
+- Added explicit adaptive chunk replan diagnostics: runtime marker (`WIKI_CHUNK_REPLAN ...`) and `wiki/log.md` fields now show whether adaptive replan was applied and the window/chunk-count before→after values.
+- Wiki data dialog now provides explicit top-row hide/show controls for source, entity, and concept nodes (alongside analysis visibility).
+- Chunked wiki ingestion now removes intermediate `analysis/*--chunk-###-of-###--analysis` pages after successful merge, while preserving the merged analysis page and source/chunk source pages.
+- Chunk-merge outputs now enforce watcher-style `Section A` through `Section I` structure; non-conforming merge LLM output automatically falls back to a sectioned extractive merge answer.
+- Chunk-merge filenames are now content-aware and unique (`...--chunk-merged--<topic>`), instead of a single generic `--chunk-merged-analysis` slug.
+- Watcher auto-analysis now skips additional source-first query generation when the same ingest already ran in chunked mode and produced a merged analysis page, preventing duplicate extra analysis files.
+
+## Incremental Update (2026-04-28)
+
+This incremental update hardens wiki maintenance quality in three areas:
+
+- semantic relevance for analysis-page Enrichment links
+- semantic relevance for analysis Context Pages selection
+- stable index summaries for resolved fallback pages
+
+### A) Enrichment link selection is semantic-first
+
+Updated in `studio/backend/core/wiki/engine.py` and `studio/backend/tests/test_wiki_rag_pipeline.py`:
+
+- Enrichment now treats LLM selection as authoritative when valid JSON is returned, including explicit empty selections.
+- Lexical selection is now used only when LLM output is invalid/unparseable schema.
+- Candidate snippets in the selector prompt now include compact page summaries to improve semantic picks.
+- Enrichment section strategy text now reflects semantic LLM selector mode when enabled.
+
+### B) Context Pages ranking is semantic-first when LLM rerank is enabled
+
+Updated in `studio/backend/core/wiki/engine.py` and `studio/backend/tests/test_wiki_rag_pipeline.py`:
+
+- LLM rerank candidate pool and top-N now scale with context-page needs so rerank output can directly drive actual context selection.
+- Deterministic tail appending after LLM rerank was removed to avoid unrelated pages leaking into `## Context Pages`.
+- Added regression coverage to ensure reranked output is not padded with non-semantic tail pages.
+
+### C) Duplicate external source summarization prevention across maintenance runs
+
+Updated in `studio/backend/core/wiki/engine.py` and `studio/backend/tests/test_wiki_rag_pipeline.py`:
+
+- Web gap-fill now normalizes source URLs and reuses existing source pages by `source_ref`.
+- If an existing source-first summary page already exists for that source, maintenance reuses it instead of creating a new `-2` analysis page.
+- Report counters now distinguish reused vs newly ingested/created external artifacts.
+
+### D) Index analysis summary title hardening
+
+Updated in `studio/backend/core/wiki/engine.py` and `studio/backend/tests/test_wiki_rag_pipeline.py`:
+
+- Index summary extraction now rejects source-first template placeholder titles such as `Section A: Brief summary paragraph`.
+- When placeholder titles are detected, index summary falls back to informative source title from the question (and keeps primary source annotation and fallback-resolved tags).
+
+### Runtime/UI parity for enrichment selector controls
+
+Updated in `studio/backend/core/wiki/runtime_env.py` and `studio/frontend/src/components/wiki-behaviour-dialog.tsx`:
+
+- Added runtime variables for enrichment LLM selector enablement and candidate cap.
+- Updated wiki behaviour dialog expected env count and category mapping.
+
 ## Changed Files
 - `studio/backend/core/wiki/ingestor.py`
 - `studio/backend/core/wiki/engine.py`
@@ -467,6 +528,11 @@ Watcher auto-analysis prompt was rewritten to be source-first and explicitly gro
 
 ### Current recommended env baseline
 ```bash
+# Model-capacity-driven wiki char budgeting baseline
+UNSLOTH_WIKI_ENGINE_MODEL_TOKEN_CAPACITY=125000
+UNSLOTH_WIKI_ENGINE_MODEL_SAFE_TOKEN_RATIO=0.50
+UNSLOTH_WIKI_ENGINE_MODEL_CHARS_PER_TOKEN=4.0
+
 # Watcher + auto-analysis
 UNSLOTH_WIKI_WATCHER=true
 UNSLOTH_WIKI_AUTO_QUERY_ON_INGEST=true
@@ -700,154 +766,270 @@ Added regression tests:
 - `studio/backend/tests/test_wiki_archive_stale.py`
 - `studio/backend/tests/test_wiki_watcher.py::test_watcher_start_schedules_raw_dir_recursively`
 
-## April 2026 Addendum (UI Upstream Force Mode)
+## April 2026 Follow-up (P2 fixes + rewrite controls)
 
-This pass closes a UX gap where Chat auto-loaded a local model even when upstream env vars were configured.
+This follow-up addresses two review-flagged P2 issues and adds explicit rewrite/compaction controls to maintenance/enrichment APIs so wiki pages do not grow unboundedly.
 
 ### Additional changed files
+- `graphify/graphify/ingest.py`
+- `studio/backend/core/inference/inference.py`
+- `studio/backend/core/wiki/engine.py`
+- `studio/backend/core/wiki/manager.py`
+- `studio/backend/routes/inference.py`
 - `studio/backend/models/inference.py`
-- `studio/backend/routes/inference.py`
-- `studio/backend/tests/test_openai_tool_passthrough.py`
-- `studio/frontend/src/features/chat/stores/chat-runtime-store.ts`
-- `studio/frontend/src/features/chat/chat-settings-sheet.tsx`
-- `studio/frontend/src/features/chat/api/chat-adapter.ts`
-- `studio/frontend/src/features/chat/runtime-provider.tsx`
-- `studio/frontend/src/features/chat/types/api.ts`
+- `studio/backend/tests/test_wiki_rag_pipeline.py`
 - `updates.md`
 
-### 1) New chat request flag: `use_upstream`
-`ChatCompletionRequest` now accepts:
-- `use_upstream: bool` (`x-unsloth` extension)
+### 1) Graphify tweet oEmbed import bug fixed
+Issue:
+- `_fetch_tweet(...)` used `urllib.request.Request/urlopen` without importing `urllib.request`.
 
-When true, `/v1/chat/completions` routes directly to configured upstream OpenAI backend and bypasses local GGUF/transformers backends, even if a local model is loaded.
+Fix:
+- Added `import urllib.request` in `graphify/graphify/ingest.py`.
 
-### 2) New Chat Settings toggle: "Use upstream backend"
-Added a persistent UI toggle in Chat Configuration -> Model.
+Impact:
+- Tweet/oEmbed fetch path no longer silently degrades due to `AttributeError` when oEmbed is otherwise available.
 
-Behavior when enabled:
-- chat requests include `use_upstream: true`
-- chat auto-load logic no longer selects/loads the smallest local model when no checkpoint is set
-- title-generation calls also use upstream routing
-- compare composer skips explicit local load-before-generate and uses upstream-routed chat calls
-- top-bar model selector blocks local load attempts until upstream mode is disabled
+### 2) Inference startup env parsing hardened
+Issue:
+- `InferenceBackend` parsed `UNSLOTH_WIKI_CHAT_HISTORY_FLUSH_SECONDS` with raw `int(os.getenv(...))` during backend initialization.
+- Non-numeric values could crash import/startup.
 
-### 3) Upstream routing safety
-If `use_upstream=true` is requested but upstream env is not configured, backend returns a clear 503 with configuration guidance.
+Fix:
+- Added `_safe_env_int(...)` helper in `studio/backend/core/inference/inference.py`.
+- Replaced the direct cast with guarded parsing + fallback default (`600`) and minimum bound (`0`).
 
-### 4) Verification status
-Validated on this branch:
+Impact:
+- Invalid env values no longer prevent inference backend startup.
+
+### 3) Rewrite/compaction controls for maintenance + enrichment
+Findings:
+- `analysis` enrichment/retry paths already used upsert-style section rewrites.
+- Entity/concept knowledge pages could still grow over time via `## Incremental Updates` accumulation.
+
+Implemented controls:
+- New wiki env knob:
+  - `UNSLOTH_WIKI_KNOWLEDGE_MAX_INCREMENTAL_UPDATES` (default `48`, max `256`)
+- `_upsert_knowledge_page(...)` now trims `Incremental Updates` to the configured maximum.
+- New engine maintenance helper:
+  - `compact_knowledge_pages(...)`
+  - Trims oversized `Incremental Updates` blocks in `entities/*` and `concepts/*`.
+
+API additions:
+- `POST /api/inference/wiki/enrich`
+  - `compact_knowledge_pages: bool = false`
+  - `max_incremental_updates: int`
+  - response now includes `knowledge_compaction` report.
+- `POST /api/inference/wiki/merge-maintenance`
+  - `compact_knowledge_pages: bool = false`
+  - `max_incremental_updates: int`
+  - response now includes `knowledge_compaction` report.
+
+Behavioral note:
+- With compaction enabled, enrichment/merge flows can actively rewrite oversized knowledge pages (not just append), while preserving recent incremental history.
+
+### 4) Verification
+Targeted checks passed:
+- `graphify/tests/test_ingest.py` -> `8 passed`
+- `studio/backend/tests/test_wiki_rag_pipeline.py -k "upsert_knowledge_page_caps_incremental_updates or enrich_analysis_pages_can_compact_knowledge_updates or merge_maintenance_can_compact_knowledge_updates_without_merges"` -> `3 passed`
+- `py_compile studio/backend/core/inference/inference.py` -> success
+
+### 5) Future add-ons (deferred): chat web-search -> wiki ingestion
+Status:
+- Not implemented in this follow-up.
+- Captured here as a potential roadmap only.
+
+Current behavior snapshot:
+- `web_search` tool output is emitted via tool events and rendered in chat UI source/tool blocks.
+- It is not automatically ingested into wiki source pages today.
+- Route-level chat history flush currently snapshots incoming chat messages before the GGUF tool loop, so tool outputs are typically not part of that persisted batch.
+
+Potential phased rollout:
+1. Phase A (low-risk, URL-only ingest)
+  - Ingest only successful `web_search` calls that used the `url` argument (full page fetch mode).
+  - Hook at GGUF tool event handling in `studio/backend/routes/inference.py` when `tool_end` is available.
+  - Write a wiki source page through existing wiki manager ingest path, with `source_ref` set to the URL.
+
+2. Phase B (safety + quality guardrails)
+  - Add opt-in env flag (default off), for example: `UNSLOTH_WIKI_INGEST_WEB_SEARCH=false`.
+  - Skip known non-content/error results (for example: `No results found`, `Search failed`, `Blocked`, fetch errors).
+  - Add dedupe/rate controls (canonical URL + content hash; per-thread/per-request limits).
+
+3. Phase C (provenance + retrieval tuning)
+  - Persist minimal provenance (query, URL, tool_call_id, timestamp) in source metadata.
+  - Optionally tag web-derived pages so ranking can down-weight them unless explicitly requested.
+
+Suggested tests when implemented:
+- Unit: tool_end URL path triggers ingest once.
+- Unit: dedupe + error-skip behavior.
+- Integration: ingested web page is retrievable through wiki query context.
+
+No API/runtime changes were made for this deferred item.
+
+### 6) Environment variable reference (consolidated)
+
+The tables below list all `UNSLOTH_*` environment variables currently referenced in this document, with a brief description and a practical recommended value.
+
+Runtime UI note:
+- The `Edit Wiki Behaviour` dialog (`/wiki/env`) shows the runtime-editable wiki subset from `WIKI_ENV_SPECS`.
+- Two variables documented below are currently not part of that runtime-editable wiki subset:
+  - `UNSLOTH_LLAMA_CPP_PREFILL_READ_TIMEOUT_SECONDS`
+  - `UNSLOTH_WIKI_INGEST_WEB_SEARCH` (deferred/not implemented)
+
+#### 6.1 Core wiki path, watcher, and ingest cadence
+
+| Env var | What it controls | Recommended value | Notes |
+|---|---|---|---|
+| `UNSLOTH_WIKI_VAULT` | Root wiki vault path (`raw/`, `wiki/`, etc.) | `./.unsloth_wiki` (project-local persistent path) | Avoid `/tmp` for long-lived knowledge unless intentionally ephemeral. |
+| `UNSLOTH_WIKI_WATCHER` | Enables background raw-folder watcher | `true` | Set `false` only for manual/route-only ingest workflows. |
+| `UNSLOTH_WIKI_PENDING_INGEST_INTERVAL_SECONDS` | Minimum delay between route-triggered pending ingest sweeps | `45` | Lower only if you need near-real-time ingest via chat path. |
+| `UNSLOTH_WIKI_PENDING_INGEST_MAX_FILES_PER_CHAT` | Max pending raw files ingested per chat request | `1` | Increase cautiously to avoid latency spikes in chat completions. |
+| `UNSLOTH_WIKI_AUTO_QUERY_ON_INGEST` | Auto-run wiki analysis query after ingest | `true` | Disable if ingest throughput is more important than immediate analysis pages. |
+| `UNSLOTH_WIKI_AUTO_QUERY_CHAT_HISTORY` | Include `chat_history_*` files in auto-analysis | `false` | Keep off by default to reduce noisy analysis pages. |
+| `UNSLOTH_WIKI_CHAT_HISTORY_FLUSH_SECONDS` | Chat-history batch flush interval | `600` | `0` forces immediate flush per request (higher IO churn). |
+| `UNSLOTH_WIKI_AUTO_LINT_EVERY` | Shared cadence for lint, fallback-retry scan, enrichment | `10` | Use `5` for more aggressive maintenance, higher for lower overhead. |
+| `UNSLOTH_WIKI_AUTO_RETRY_FALLBACK_ANALYSES_MAX_PAGES` | Max recent fallback analysis pages scanned per maintenance run | `24` | Set `0` to disable fallback-retry scanning. |
+
+#### 6.2 Route-level chat RAG controls
+
+| Env var | What it controls | Recommended value | Notes |
+|---|---|---|---|
+| `UNSLOTH_WIKI_RAG_MAX_PAGES` | Max pages injected by route-level RAG | `8` | Lower to `4-6` if responses start repeating or drifting. |
+| `UNSLOTH_WIKI_RAG_MAX_CHARS_PER_PAGE` | Per-page snippet cap in route-level RAG | `1800` | Lower to `1000-1400` for small-context GGUF models. |
+| `UNSLOTH_WIKI_RAG_MAX_TOTAL_CHARS` | Total route-level injected context cap | `12000` | First knob to reduce when you see context pressure or garbling. |
+| `UNSLOTH_WIKI_RAG_INCLUDE_SOURCE_PAGES` | Include `wiki/sources/*` in route-level retrieval | `true` | Keep enabled unless source pages are very noisy. |
+| `UNSLOTH_WIKI_INDEX_INCLUDE_SOURCE_PAGES` | Include sources in index-level retrieval helpers | `true` | Keep aligned with `UNSLOTH_WIKI_RAG_INCLUDE_SOURCE_PAGES`. |
+| `UNSLOTH_WIKI_LLM_MAX_TOKENS` | Token budget for wiki-generated responses | `1200` | Lower for faster/shorter answers, raise carefully for depth if model/context allows. |
+| `UNSLOTH_WIKI_LOG_INJECTED_CONTEXT` | Logs injected RAG context to backend logs | `true` during tuning, `false` for quiet prod logs | Useful for diagnosing context quality and truncation behavior. |
+| `UNSLOTH_WIKI_LOG_INJECTED_CONTEXT_MAX_CHARS` | Max logged chars for injected context | `12000` | Set `0` for no log truncation (can produce very large logs). |
+
+#### 6.3 Wiki engine retrieval, extraction, and ranking
+
+| Env var | What it controls | Recommended value | Notes |
+|---|---|---|---|
+| `UNSLOTH_WIKI_ENGINE_MODEL_TOKEN_CAPACITY` | Model token capacity baseline used to derive char limits when per-knob overrides are unset | `125000` | Set `0` to disable derivation and keep explicit per-knob values only. |
+| `UNSLOTH_WIKI_ENGINE_MODEL_SAFE_TOKEN_RATIO` | Safe fraction of model token capacity used for wiki budgets | `0.50` | Safe token budget = `MODEL_TOKEN_CAPACITY * MODEL_SAFE_TOKEN_RATIO`. |
+| `UNSLOTH_WIKI_ENGINE_MODEL_CHARS_PER_TOKEN` | Token-to-character heuristic used for derived wiki char limits | `4.0` | Safe char budget = safe token budget × chars-per-token. |
+| `UNSLOTH_WIKI_ENGINE_EXTRACT_SOURCE_MAX_CHARS` | Max source text fed into extraction | `20000` | Raise for long papers only if extraction misses key sections. |
+| `UNSLOTH_WIKI_ENGINE_SOURCE_EXCERPT_MAX_CHARS` | Max excerpt persisted on source pages | `8000` | Larger excerpts improve traceability but increase page size. |
+| `UNSLOTH_WIKI_ENGINE_RANKING_MAX_CHARS` | Max chars read per page for ranking | `24000` | Do not set to `0` while debugging quality; unlimited can destabilize ranking. |
+| `UNSLOTH_WIKI_ENGINE_MAX_CONTEXT_PAGES` | Max pages used by engine query context | `16` | `0` means unlimited; prefer finite caps for stable analysis quality. |
+| `UNSLOTH_WIKI_ENGINE_MAX_CHARS_PER_PAGE` | Per-page cap for engine query context | `3500` | `0` means unlimited; risky for repetition/degeneration. |
+| `UNSLOTH_WIKI_ENGINE_QUERY_CONTEXT_MAX_CHARS` | Total engine query context cap | `24000` | `0` means unlimited; avoid during fallback-quality tuning. |
+| `UNSLOTH_WIKI_ENGINE_INCLUDE_ANALYSIS_IN_QUERY` | Include prior `analysis/*` pages in retrieval | `true` | Set `false` if old analyses bias current answers too much. |
+| `UNSLOTH_WIKI_ENGINE_RANKING_LINK_DEPTH` | Graph/link expansion depth in ranking | `2` | Larger values can increase recall but also add noise/latency. |
+| `UNSLOTH_WIKI_ENGINE_RANKING_LINK_FANOUT` | Link fanout per hop during expansion | `8` | Keep moderate to prevent combinatorial candidate growth. |
+| `UNSLOTH_WIKI_ENGINE_LLM_RERANK_ENABLED` | LLM rerank on ranking candidates | `true` | Keep enabled for better relevance when latency budget permits. |
+| `UNSLOTH_WIKI_ENGINE_LLM_RERANK_CANDIDATES` | Candidate pool size before LLM rerank | `32` | Lower for speed, raise for recall on broad corpora. |
+| `UNSLOTH_WIKI_ENGINE_LLM_RERANK_TOP_N` | Number of reranked candidates kept | `12` | Keep below candidates; tune with context caps together. |
+| `UNSLOTH_WIKI_ENGINE_LLM_RERANK_PREVIEW_CHARS` | Per-candidate preview chars for rerank prompt | `420` | Raise only if reranker lacks enough local context. |
+| `UNSLOTH_WIKI_ENGINE_LLM_RERANK_LOG_OUTPUT` | Enable reranker output logging for diagnostics | `true` during tuning, `false` for quieter logs | Keep on while validating retrieval quality; disable in noisy/production runs. |
+| `UNSLOTH_WIKI_ENGINE_LLM_RERANK_LOG_MAX_CHARS` | Max chars logged per reranker output entry | `4000` | Lower if logs are too verbose; raise only when deeper rerank debugging is needed. |
+
+Quick copy-paste preset for a 125k model-token baseline:
+
 ```bash
-/Users/zohairshafi/Local\ Workspace/unsloth/.venv/bin/python -m pytest -q studio/backend/tests/test_openai_tool_passthrough.py
-# 62 passed
-
-cd studio/frontend && npm run typecheck
-# success
+UNSLOTH_WIKI_ENGINE_MODEL_TOKEN_CAPACITY=125000
+UNSLOTH_WIKI_ENGINE_MODEL_SAFE_TOKEN_RATIO=0.50
+UNSLOTH_WIKI_ENGINE_MODEL_CHARS_PER_TOKEN=4.0
 ```
 
-## April 2026 Addendum (Sidebar Wiki Actions)
+With defaults above (and no explicit per-knob char overrides), derived budgets are:
+- Safe token budget: `62500`
+- Safe char budget: `250000`
+- Derived `EXTRACT_SOURCE_MAX_CHARS`, `QUERY_CONTEXT_MAX_CHARS`, `RANKING_MAX_CHARS`, `CHUNK_ANALYSIS_CONTEXT_WINDOW_CHARS`, `CHUNK_ANALYSIS_MAX_CHARS`: `250000`
+- Derived `SOURCE_EXCERPT_MAX_CHARS`: `50000`
+- Derived `MAX_CHARS_PER_PAGE` (with `MAX_CONTEXT_PAGES=16`): `15625`
 
-Added two quick actions in the main left sidebar (same section as Train / Recipes / Export):
+#### 6.4 Background auto-analysis and fallback controls
 
-- `Lint`
-  - Calls `GET /api/inference/wiki/lint`
-  - Shows a summary toast with page totals, orphan count, stale count, and broken-link count.
+| Env var | What it controls | Recommended value | Notes |
+|---|---|---|---|
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_CONTEXT_FRACTION` | Fraction of model context budget allocated to auto-analysis context | `0.70` | Lower (`0.50-0.60`) if auto analyses are repetitive/garbled. |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_CHARS_PER_TOKEN` | Token->char conversion heuristic | `4` | Keep at `4` unless tokenizer/domain strongly differs. |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_RETRY_ON_FALLBACK` | Retry auto-analysis when fallback quality gates trigger | `true` | Disable only to minimize compute. |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_MAX_RETRIES` | Max retry attempts after fallback | `3` | `2-3` is usually enough; more can amplify cost without benefit. |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_RETRY_REDUCTION` | Context reduction factor per retry | `0.5` | Smaller factor reduces context faster and often improves stability. |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_MIN_CONTEXT_CHARS` | Floor for retry-reduced context | `8000` | Lower to `4000-6000` for very small models if still garbled. |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_SOURCE_ONLY` | Force source-only analysis context | `false` (normal), `true` (stability mode) | Strongly helps when analysis pages become self-referential/noisy. |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_SOURCE_ONLY_FINAL_RETRY` | Force source-only context on final retry | `true` | Good guardrail to recover from repeated fallback loops. |
+| `UNSLOTH_LLAMA_CPP_PREFILL_READ_TIMEOUT_SECONDS` | Prefill read timeout for llama.cpp generation path | `300` for typical local runs, increase up to `18000` for very large prompts/models | Raise if long-prefill requests fail with timeout. |
+| `UNSLOTH_WIKI_LOW_UNIQUE_RATIO_MIN_TOKENS` | Minimum token count before low-unique-ratio gate applies | `40` | Keep default unless gate triggers too aggressively on short outputs. |
+| `UNSLOTH_WIKI_LOW_UNIQUE_RATIO_THRESHOLD` | Repetition gate threshold for low unique-token ratio | `0.25` | Raise slightly (`0.28-0.32`) for stricter anti-repetition gating. |
 
-- `Maintenance`
-  - Calls `POST /api/inference/wiki/merge-maintenance` with `{"dry_run": false}`
-  - Shows a summary toast with applied merges and rewritten page/link counts.
+#### 6.5 Enrichment, compaction, and deferred knobs
 
-Both actions are authenticated with existing Studio auth headers and show descriptive error toasts on failure.
+| Env var | What it controls | Recommended value | Notes |
+|---|---|---|---|
+| `UNSLOTH_WIKI_ENGINE_ENRICH_FILL_GAPS_FROM_WEB` | Enable lint-driven web gap fill during enrichment | `false` by default | Turn on for targeted enrichment passes, not continuously. |
+| `UNSLOTH_WIKI_ENGINE_ENRICH_WEB_GAP_MAX_QUERIES` | Max missing-concept web queries per run | `4` | Increase gradually if concept coverage remains poor. |
+| `UNSLOTH_WIKI_ENGINE_ENRICH_WEB_GAP_MAX_RESULTS` | Max search results considered per query | `3` | Higher values can pull in noise quickly. |
+| `UNSLOTH_WIKI_ENGINE_ENRICH_WEB_GAP_MAX_SNIPPET_CHARS` | Snippet length cap used for drafted concept pages | `280` | Keep concise to avoid verbose low-confidence drafts. |
+| `UNSLOTH_WIKI_ENGINE_ENRICH_REFRESH_OLDEST_NON_FALLBACK_PAGES` | Refresh oldest non-fallback analysis pages before link enrichment | `0` (off by default), try `3-12` for periodic freshness sweeps | Useful for stale-summary refresh without touching fallback-only retry behavior. |
+| `UNSLOTH_WIKI_ENGINE_ENRICH_REPAIR_ANSWER_LINKS` | Repair unresolved wiki links inside analysis Answer sections during enrichment | `false` (safe default), set `true` for aggressive cleanup | Enabled mode can remove unresolved citations from prose; keep off when preserving original answer wording is preferred. |
+| `UNSLOTH_WIKI_MERGE_MAINTENANCE_MAX_MERGES` | Max concept/entity merge operations per maintenance run | `512` | Lower if maintenance spikes CPU/latency; raise only for very stale corpora. |
+| `UNSLOTH_WIKI_KNOWLEDGE_MAX_INCREMENTAL_UPDATES` | Max retained incremental update blocks per entity/concept page | `48` | Lower for compact pages, raise for deeper change history retention. |
+| `UNSLOTH_WIKI_INGEST_WEB_SEARCH` | Deferred future flag for chat web-search ingestion to wiki | `false` | Not implemented in current runtime; documented as future add-on. |
 
-Also added a model-picker option in Chat named `Upstream backend`.
-- Selecting it enables upstream mode immediately (`use_upstream` routing), so users can opt into env-configured upstream directly from the picker.
+#### 6.6 Caveats and recommended profile for garbled analyses
 
-## April 2026 Addendum (Upstream UX + 422 Hardening)
+If you observe repetitive, incoherent, or obviously degenerate `analysis/*` output:
 
-Follow-up fixes after enabling upstream picker mode:
+1. Avoid unlimited context settings during diagnosis:
+  - Do **not** use `0` for:
+    - `UNSLOTH_WIKI_ENGINE_MAX_CONTEXT_PAGES`
+    - `UNSLOTH_WIKI_ENGINE_MAX_CHARS_PER_PAGE`
+    - `UNSLOTH_WIKI_ENGINE_QUERY_CONTEXT_MAX_CHARS`
+    - `UNSLOTH_WIKI_ENGINE_RANKING_MAX_CHARS`
 
-- Think / Search / Code toggles are now usable in upstream mode (single-chat + compare composer).
-  - They no longer require a locally loaded model when upstream mode is active.
-  - Upstream requests now include the same toggle intent fields (`enable_thinking`, `enable_tools`, `enabled_tools`) at the Studio route boundary.
+2. Apply this stability profile first (known-good starting point):
 
-- Sidebar `Lint` and `Maintenance` quick actions are no longer blocked by chat-only mode.
-  - They are disabled only while the action itself is in progress.
+| Env var | Recommended value for garbled-analysis mitigation |
+|---|---|
+| `UNSLOTH_WIKI_RAG_MAX_TOTAL_CHARS` | `6000` |
+| `UNSLOTH_WIKI_RAG_MAX_PAGES` | `4` |
+| `UNSLOTH_WIKI_RAG_MAX_CHARS_PER_PAGE` | `1200` |
+| `UNSLOTH_WIKI_ENGINE_QUERY_CONTEXT_MAX_CHARS` | `8000` |
+| `UNSLOTH_WIKI_ENGINE_MAX_CONTEXT_PAGES` | `6` |
+| `UNSLOTH_WIKI_ENGINE_MAX_CHARS_PER_PAGE` | `1400` |
+| `UNSLOTH_WIKI_ENGINE_RANKING_MAX_CHARS` | `12000` |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_CONTEXT_FRACTION` | `0.55` |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_SOURCE_ONLY` | `true` |
+| `UNSLOTH_WIKI_AUTO_ANALYSIS_SOURCE_ONLY_FINAL_RETRY` | `true` |
 
-- Reduced opaque `Request failed (422)` behavior:
-  - Frontend error parsing now extracts FastAPI/Pydantic validation details from array-style `detail` payloads.
-  - Outbound chat history normalization now avoids empty-content messages that can trigger backend 422 validation errors (for example multimodal turns with no text).
+3. Tuning order (to preserve answer quality while reducing degeneration):
+  - Lower `UNSLOTH_WIKI_RAG_MAX_TOTAL_CHARS` first.
+  - Then lower `UNSLOTH_WIKI_RAG_MAX_PAGES`.
+  - Then lower `UNSLOTH_WIKI_RAG_MAX_CHARS_PER_PAGE`.
+  - Only after that, tighten engine-level caps.
 
-## April 2026 Addendum (NVIDIA/OpenAI Upstream Adapter Branch)
+4. Caveat:
+  - Over-tightening can improve fluency but hurt factual recall. Balance with your model size and domain complexity.
 
-This pass adds an env-driven OpenAI-compatible upstream mode so Studio can serve chat/wiki flows without loading a local GGUF or transformers model.
+## April 2026 Addendum (LLM Link Expansion Selector)
 
-### Additional changed files
-- `studio/backend/main.py`
-- `studio/backend/routes/inference.py`
-- `studio/backend/tests/test_openai_tool_passthrough.py`
+This pass adds an optional semantic selector for ranking-time link expansion so traversal can prioritize links by query intent rather than lexical path overlap alone.
+
+### Changed files
+- `studio/backend/core/wiki/engine.py`
+- `studio/backend/tests/test_wiki_rag_pipeline.py`
 - `updates.md`
 
-### 1) Route-level upstream mode for chat + wiki LLM calls
-New env knobs in `studio/backend/routes/inference.py`:
-- `UNSLOTH_LLM_UPSTREAM_BASE_URL`
-- `UNSLOTH_LLM_UPSTREAM_API_KEY`
-- `UNSLOTH_LLM_UPSTREAM_MODEL`
-- `UNSLOTH_LLM_UPSTREAM_TIMEOUT_SECONDS` (default: `600`)
+### Behavior changes
+1. Link expansion now supports an LLM selector stage.
+  - During `_expand_ranked_pages_by_links`, depth-0 seed pages can invoke a link-selection prompt.
+  - The selector chooses from concrete outgoing wikilinks only and is hard-bounded by fanout.
+2. Safety and fallback behavior are preserved.
+  - If selector output is invalid/empty, expansion falls back to existing lexical sort (`ranked_map` prior + path-overlap).
+  - Selector is budgeted to a small number of seed pages per query to avoid runaway LLM calls.
+3. Query diagnostics now include selector settings on saved analysis pages.
 
-Behavior:
-- `POST /v1/chat/completions` now falls back to upstream OpenAI-compatible chat when no local model is active.
-- Wiki route LLM stub now also falls back to upstream for extraction/maintenance prompts if local backends are unavailable.
-- `GET /v1/models` now attempts upstream model listing (`/models`) and merges those IDs with local model IDs.
+### New env variables
+| Env var | What it controls | Default |
+|---|---|---|
+| `UNSLOTH_WIKI_ENGINE_RANKING_LINK_LLM_SELECTOR_ENABLED` | Enables semantic LLM link selection in expansion traversal | `true` |
+| `UNSLOTH_WIKI_ENGINE_RANKING_LINK_LLM_SELECTOR_MAX_CANDIDATES` | Max outgoing links exposed to selector prompt per source page | `24` |
 
-### 2) Watcher auto-analysis availability now recognizes upstream mode
-In `studio/backend/main.py`, watcher startup `llm_available_fn` now returns true if upstream mode is configured, so background wiki auto-analysis is not blocked by lack of a local loaded model.
-
-### 3) Optional upstream fallback for `/v1/completions`
-New toggle:
-- `UNSLOTH_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK` (default: `true`)
-
-Behavior:
-- If GGUF is not loaded and upstream is configured, `/v1/completions` proxies upstream.
-- Streaming and non-streaming both supported through the same upstream passthrough.
-
-### 4) Optional upstream fallback for `/v1/embeddings` (disabled by default)
-New toggle:
-- `UNSLOTH_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK` (default: `false`)
-
-Why default is `false`:
-- embedding dimensions, pooling behavior, and model compatibility can differ across providers.
-- clients often assume a stable vector shape and model identity for persistence/retrieval stores.
-
-When to enable:
-- only after selecting and pinning a specific upstream embedding model and confirming downstream vector-store dimensional compatibility.
-
-### 5) NVIDIA endpoint note from trial run
-Observed with provided API key:
-- `https://nim.api.nvidia.com/v1` returned `403` on `/models` and `404` for attempted model IDs.
-- `https://integrate.api.nvidia.com/v1` worked for both `/models` and chat completions.
-
-Recommended initial upstream env baseline:
-```bash
-UNSLOTH_LLM_UPSTREAM_BASE_URL=https://integrate.api.nvidia.com/v1
-UNSLOTH_LLM_UPSTREAM_API_KEY=${NVIDIA_API_KEY}
-UNSLOTH_LLM_UPSTREAM_MODEL=meta/llama-3.1-8b-instruct
-UNSLOTH_LLM_UPSTREAM_TIMEOUT_SECONDS=600
-
-# Optional endpoint fallbacks
-UNSLOTH_LLM_UPSTREAM_ENABLE_COMPLETIONS_FALLBACK=true
-UNSLOTH_LLM_UPSTREAM_ENABLE_EMBEDDINGS_FALLBACK=false
-```
-
-### 6) Validation status
-Focused tests currently passing on this branch:
-```bash
-/Users/zohairshafi/Local\ Workspace/unsloth/.venv/bin/python -m pytest -q studio/backend/tests/test_openai_tool_passthrough.py
-# 62 passed
-
-/Users/zohairshafi/Local\ Workspace/unsloth/.venv/bin/python -m pytest -q studio/backend/tests/test_wiki_rag_pipeline.py
-# 48 passed
-```
-
-### Deferred hardening ideas (kept out of current PR scope)
-- Deterministic small-talk bypass for server-side tools (for example `hi`, `hello`) so tool loops are skipped on pure greetings.
-- Repeated-tool-loop breaker that stops identical tool calls after N attempts and forces a final answer.
-- These are intentionally deferred to reduce PR scope and review risk; revisit in a follow-up hardening PR if upstream tool-loop regressions reappear.
+### Regression coverage added
+- `test_rank_pages_link_expansion_can_use_llm_selector`
+- `test_rank_pages_link_expansion_llm_selector_falls_back_to_lexical`

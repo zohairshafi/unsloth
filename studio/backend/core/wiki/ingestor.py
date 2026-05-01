@@ -51,6 +51,7 @@ class WikiIngestor:
         self.wiki_manager = wiki_manager
         self.raw_dir = raw_dir
         self.raw_dir.mkdir(parents = True, exist_ok = True)
+        self._recent_ingest_metadata: Dict[str, Dict[str, Any]] = {}
 
     _SKIPPED_LOCAL_FILENAMES = {".ds_store", "thumbs.db"}
     _FALLBACK_SUPPORTED_SUFFIXES = {
@@ -288,6 +289,23 @@ class WikiIngestor:
             raise ValueError(f"Ingestion produced empty content for {file_path}")
         return file_path.stem, cleaned
 
+    def _extract_source_limit_chars(self) -> int:
+        """Best-effort extraction capacity used by standard ingest before truncation."""
+        fallback = 20_000
+        try:
+            engine = getattr(self.wiki_manager, "engine", None)
+            cfg = getattr(engine, "cfg", None)
+            value = int(getattr(cfg, "extract_source_max_chars", fallback))
+            return max(1, value)
+        except Exception:
+            return fallback
+
+    def _should_use_chunked_ingest(self, content: str) -> bool:
+        text = str(content or "")
+        if not text:
+            return False
+        return len(text) > self._extract_source_limit_chars()
+
     def _ingest_remote_source(
         self, source: str, contributor: Optional[str]
     ) -> Tuple[str, str]:
@@ -296,6 +314,20 @@ class WikiIngestor:
             raise FileNotFoundError(f"Ingestion failed: {ingested_path} does not exist")
         title, content = self._read_local_content(ingested_path)
         return title, content
+
+    def _ingest_metadata_key(self, source: Path | str) -> str:
+        if isinstance(source, Path):
+            try:
+                return str(source.expanduser().resolve())
+            except Exception:
+                return str(source)
+        return str(source)
+
+    def pop_recent_ingest_metadata(
+        self, source: Path | str
+    ) -> Optional[Dict[str, Any]]:
+        key = self._ingest_metadata_key(source)
+        return self._recent_ingest_metadata.pop(key, None)
 
     def ingest_file(
         self, file_path: Path, contributor: Optional[str] = None
@@ -336,15 +368,45 @@ class WikiIngestor:
             # For now, we'll treat it as a text source, but we could use graphify.extract
             # to add more metadata to the wiki nodes.
 
-            # 3. Ingest into the wiki engine
-            result = self.wiki_manager.ingest_content(
-                title = title,
-                content = content,
-                reference = reference,
-            )
+            # 3. Ingest into the wiki engine.
+            # Route oversized sources to chunked ingest so raw drops can scale
+            # without manual mode switching.
+            content_chars = len(content)
+            source_limit_chars = self._extract_source_limit_chars()
+            use_chunked_ingest = self._should_use_chunked_ingest(content)
+
+            if use_chunked_ingest:
+                result = self.wiki_manager.ingest_content_with_chunked_analysis(
+                    title = title,
+                    content = content,
+                    reference = reference,
+                )
+            else:
+                result = self.wiki_manager.ingest_content(
+                    title = title,
+                    content = content,
+                    reference = reference,
+                )
+
+            ingest_mode = "chunked" if use_chunked_ingest else "standard"
+            source_key = self._ingest_metadata_key(file_path)
+            result_dict = result if isinstance(result, dict) else {}
+            self._recent_ingest_metadata[source_key] = {
+                "title": title,
+                "mode": ingest_mode,
+                "source_page": str(result_dict.get("source_page", "") or ""),
+                "merged_analysis_page": str(
+                    result_dict.get("merged_analysis_page", "") or ""
+                ),
+            }
 
             logger.info(
-                f"Successfully ingested {file_path.name} into wiki. Result: {result}"
+                "Successfully ingested %s into wiki (mode=%s, content_chars=%s, standard_limit_chars=%s). Result: %s",
+                file_path.name,
+                ingest_mode,
+                content_chars,
+                source_limit_chars,
+                result,
             )
             return title
 

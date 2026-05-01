@@ -138,7 +138,7 @@ if str(backend_path) not in sys.path:
 # Import backend functions
 try:
     from core.inference import get_inference_backend
-    from core.inference.llama_cpp import LlamaCppBackend
+    from core.inference.llama_cpp import LlamaCppBackend, detect_reasoning_flags
     from utils.models import ModelConfig
     from utils.inference import load_inference_config
     from utils.models.model_config import load_model_defaults
@@ -147,7 +147,7 @@ except ImportError:
     if str(parent_backend) not in sys.path:
         sys.path.insert(0, str(parent_backend))
     from core.inference import get_inference_backend
-    from core.inference.llama_cpp import LlamaCppBackend
+    from core.inference.llama_cpp import LlamaCppBackend, detect_reasoning_flags
     from utils.models import ModelConfig
     from utils.inference import load_inference_config
     from utils.models.model_config import load_model_defaults
@@ -176,6 +176,12 @@ from models.inference import (
     RagContextSnippet,
     WikiArchiveRequest,
     WikiArchiveResponse,
+    WikiDeletePreviewRequest,
+    WikiDeleteApplyRequest,
+    WikiDeleteResponse,
+    WikiDataGraphResponse,
+    WikiDataGraphNode,
+    WikiDataGraphEdge,
     WikiIngestRequest,
     WikiIngestResponse,
     WikiEnrichRequest,
@@ -187,6 +193,9 @@ from models.inference import (
     WikiQueryRequest,
     WikiQueryResponse,
     WikiLintResponse,
+    WikiEnvConfigResponse,
+    WikiEnvSetRequest,
+    WikiEnvSetResponse,
     WikiGraphifyExportRequest,
     WikiGraphifyExportResponse,
     TextContentPart,
@@ -231,6 +240,11 @@ import datetime as _datetime
 
 from core.wiki.manager import WikiManager
 from core.wiki.ingestor import WikiIngestor
+from core.wiki.runtime_env import (
+    collect_wiki_env_state,
+    update_wiki_env_values,
+    wiki_env_overrides_file,
+)
 
 router = APIRouter()
 
@@ -250,12 +264,20 @@ _TOOL_XML_RE = _re.compile(
 )
 logger = get_logger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 _WIKI_VAULT_ROOT = Path(os.getenv("UNSLOTH_WIKI_VAULT", "/tmp/unsloth_wiki"))
 _ROUTE_WIKI_MANAGER: Optional[WikiManager] = None
 _ROUTE_WIKI_INGESTOR: Optional[WikiIngestor] = None
-_RAG_MAX_PAGES = int(os.getenv("UNSLOTH_WIKI_RAG_MAX_PAGES", "8"))
-_RAG_MAX_CHARS_PER_PAGE = int(os.getenv("UNSLOTH_WIKI_RAG_MAX_CHARS_PER_PAGE", "1800"))
-_RAG_MAX_TOTAL_CHARS = int(os.getenv("UNSLOTH_WIKI_RAG_MAX_TOTAL_CHARS", "12000"))
+_RAG_MAX_PAGES = _env_int("UNSLOTH_WIKI_RAG_MAX_PAGES", 8)
+_RAG_MAX_CHARS_PER_PAGE = _env_int("UNSLOTH_WIKI_RAG_MAX_CHARS_PER_PAGE", 1800)
+_RAG_MAX_TOTAL_CHARS = _env_int("UNSLOTH_WIKI_RAG_MAX_TOTAL_CHARS", 12000)
 _RAG_INCLUDE_SOURCE_PAGES = os.getenv(
     "UNSLOTH_WIKI_RAG_INCLUDE_SOURCE_PAGES", "true"
 ).strip().lower() not in {"0", "false", "no", "off"}
@@ -424,6 +446,26 @@ def _loggable_rag_context(context: str) -> str:
         context[:_RAG_LOG_INJECTED_CONTEXT_MAX_CHARS].rstrip()
         + "\n...[truncated by UNSLOTH_WIKI_LOG_INJECTED_CONTEXT_MAX_CHARS]"
     )
+
+
+def _restart_supported(request: Request) -> bool:
+    return callable(getattr(request.app.state, "trigger_restart", None))
+
+
+def _schedule_backend_restart(request: Request) -> bool:
+    trigger_restart = getattr(request.app.state, "trigger_restart", None)
+    if not callable(trigger_restart):
+        return False
+
+    async def _delayed_restart() -> None:
+        await asyncio.sleep(0.2)
+        try:
+            trigger_restart()
+        except Exception as exc:
+            logger.warning("Failed to trigger backend restart: %s", exc)
+
+    request.app.state._restart_task = asyncio.create_task(_delayed_restart())
+    return True
 
 
 def _wiki_llm_available() -> bool:
@@ -721,6 +763,7 @@ def _archive_stale_wiki_pages(
     dry_run: bool,
     keep_recent_chat: int,
     keep_recent_per_source: int,
+    move_raw_files: bool = False,
 ) -> dict[str, Any]:
     sources_dir = _WIKI_VAULT_ROOT / "wiki" / "sources"
     archive_sources_dir = _WIKI_VAULT_ROOT / "wiki" / ".archive" / "sources"
@@ -781,7 +824,7 @@ def _archive_stale_wiki_pages(
 
             report["moved_sources"].append(str(target))
 
-            if source_ref:
+            if move_raw_files and source_ref:
                 raw_path = Path(source_ref)
                 if raw_path.exists() and raw_dir in raw_path.parents:
                     raw_target = archive_raw_dir / raw_path.name
@@ -872,6 +915,7 @@ def _get_route_rag_context(
         max_chars_per_page = max(max_chars_per_page * 6, 6000),
         include_source_pages = _RAG_INCLUDE_SOURCE_PAGES,
     )
+    ranking_mode = str(result.get("ranking_mode", "unknown") or "unknown")
     blocks: list[dict] = result.get("context_blocks", [])
     if not _RAG_INCLUDE_SOURCE_PAGES:
         blocks = [
@@ -1097,6 +1141,7 @@ def _get_route_rag_context(
         "query": query,
         "source": debug_source,
         "wants_history": wants_history,
+        "ranking_mode": ranking_mode,
         "context": context,
         "context_characters": len(context),
         "pages_considered": len(blocks),
@@ -1232,6 +1277,7 @@ async def archive_stale_wiki_sources(
         dry_run = payload.dry_run,
         keep_recent_chat = payload.keep_recent_chat,
         keep_recent_per_source = payload.keep_recent_per_source,
+        move_raw_files = payload.move_raw_files,
     )
 
     if report["moved_count"] and not payload.dry_run:
@@ -1246,6 +1292,144 @@ async def archive_stale_wiki_sources(
         moved_raw = [str(x) for x in report["moved_raw"]],
         errors = [str(x) for x in report["errors"]],
     )
+
+
+def _to_wiki_delete_response(report: dict[str, Any]) -> WikiDeleteResponse:
+    return WikiDeleteResponse(
+        status = str(report.get("status", "ok")),
+        dry_run = bool(report.get("dry_run", True)),
+        hard_delete = bool(report.get("hard_delete", False)),
+        entry_type = str(report.get("entry_type", "")),
+        cascade_orphan_knowledge = bool(report.get("cascade_orphan_knowledge", True)),
+        requested_entries = [str(item) for item in report.get("requested_entries", [])],
+        resolved_entries = [str(item) for item in report.get("resolved_entries", [])],
+        missing_entries = [str(item) for item in report.get("missing_entries", [])],
+        invalid_entries = [str(item) for item in report.get("invalid_entries", [])],
+        planned_source_pages = [
+            str(item) for item in report.get("planned_source_pages", [])
+        ],
+        planned_analysis_pages = [
+            str(item) for item in report.get("planned_analysis_pages", [])
+        ],
+        planned_entity_pages = [
+            str(item) for item in report.get("planned_entity_pages", [])
+        ],
+        planned_concept_pages = [
+            str(item) for item in report.get("planned_concept_pages", [])
+        ],
+        planned_total_pages = int(report.get("planned_total_pages", 0)),
+        archived_pages = [str(item) for item in report.get("archived_pages", [])],
+        deleted_pages = [str(item) for item in report.get("deleted_pages", [])],
+        errors = [str(item) for item in report.get("errors", [])],
+    )
+
+
+def _to_wiki_data_graph_response(report: dict[str, Any]) -> WikiDataGraphResponse:
+    valid_kinds = {"source", "analysis", "entity", "concept"}
+
+    nodes: list[WikiDataGraphNode] = []
+    for item in report.get("nodes", []):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "")).strip().lower()
+        if kind not in valid_kinds:
+            continue
+        nodes.append(
+            WikiDataGraphNode(
+                id = str(item.get("id", "")),
+                kind = kind,
+                label = str(item.get("label", "")),
+                inbound_links = int(item.get("inbound_links", 0)),
+                outbound_links = int(item.get("outbound_links", 0)),
+            )
+        )
+
+    edges: list[WikiDataGraphEdge] = []
+    for item in report.get("edges", []):
+        if not isinstance(item, dict):
+            continue
+        edges.append(
+            WikiDataGraphEdge(
+                id = str(item.get("id", "")),
+                source = str(item.get("source", "")),
+                target = str(item.get("target", "")),
+            )
+        )
+
+    return WikiDataGraphResponse(
+        status = str(report.get("status", "ok")),
+        nodes = nodes,
+        edges = edges,
+    )
+
+
+@router.get("/wiki/data/graph", response_model = WikiDataGraphResponse)
+async def wiki_data_graph(
+    include_analysis: bool = True,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Return wiki graph data (sources/entities/concepts and optional analysis)."""
+    manager, _ = _get_route_wiki_components()
+
+    try:
+        report = manager.get_wiki_data_graph(include_analysis = include_analysis)
+    except Exception as exc:
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail = f"Wiki data graph failed: {exc}",
+        )
+
+    return _to_wiki_data_graph_response(report)
+
+
+@router.post("/wiki/delete/preview", response_model = WikiDeleteResponse)
+async def wiki_delete_preview(
+    payload: WikiDeletePreviewRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Preview wiki entry deletion impact including orphan knowledge cascade."""
+    manager, _ = _get_route_wiki_components()
+
+    try:
+        report = manager.delete_wiki_entries(
+            entry_type = payload.entry_type,
+            entries = payload.entries,
+            dry_run = True,
+            cascade_orphan_knowledge = payload.cascade_orphan_knowledge,
+            hard_delete = False,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail = f"Wiki delete preview failed: {exc}",
+        )
+
+    return _to_wiki_delete_response(report)
+
+
+@router.post("/wiki/delete/apply", response_model = WikiDeleteResponse)
+async def wiki_delete_apply(
+    payload: WikiDeleteApplyRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Apply wiki entry deletion with archive-first default and optional hard delete."""
+    manager, _ = _get_route_wiki_components()
+
+    try:
+        report = manager.delete_wiki_entries(
+            entry_type = payload.entry_type,
+            entries = payload.entries,
+            dry_run = False,
+            cascade_orphan_knowledge = payload.cascade_orphan_knowledge,
+            hard_delete = payload.hard_delete,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail = f"Wiki delete apply failed: {exc}",
+        )
+
+    return _to_wiki_delete_response(report)
 
 
 @router.post("/wiki/ingest", response_model = WikiIngestResponse)
@@ -1294,9 +1478,15 @@ async def wiki_enrich(
     """Enrich wiki analysis pages by prepending an index-driven Enrichment section."""
     manager, _ = _get_route_wiki_components()
 
-    # Keep manual enrichment behavior aligned with scheduled maintenance:
-    # retry fallback pages first, then run enrichment.
-    if _WIKI_AUTO_RETRY_FALLBACK_MAX_PAGES > 0:
+    run_fallback_retry_first = (
+        _WIKI_AUTO_RETRY_FALLBACK_MAX_PAGES > 0
+        if payload.run_fallback_retry_first is None
+        else bool(payload.run_fallback_retry_first)
+    )
+
+    # Keep manual enrichment behavior aligned with scheduled maintenance by
+    # optionally retrying fallback pages first.
+    if run_fallback_retry_first:
         try:
             retry_report = manager.retry_fallback_analysis_pages(
                 dry_run = payload.dry_run,
@@ -1318,6 +1508,10 @@ async def wiki_enrich(
             max_analysis_pages = payload.max_analysis_pages,
             fill_gaps_from_web = payload.fill_gaps_from_web,
             max_web_gap_queries = payload.max_web_gap_queries,
+            refresh_non_fallback_oldest_pages = payload.refresh_non_fallback_oldest_pages,
+            repair_answer_links = payload.repair_answer_links,
+            compact_knowledge_pages = payload.compact_knowledge_pages,
+            max_incremental_updates = payload.max_incremental_updates,
         )
     except Exception as exc:
         raise HTTPException(
@@ -1332,6 +1526,9 @@ async def wiki_enrich(
         updated_pages = int(report.get("updated_pages", 0)),
         changes = [dict(item) for item in report.get("changes", [])],
         web_gap_fill = dict(report.get("web_gap_fill", {})),
+        non_fallback_refresh = dict(report.get("non_fallback_refresh", {})),
+        analysis_link_repair = dict(report.get("analysis_link_repair", {})),
+        knowledge_compaction = dict(report.get("knowledge_compaction", {})),
     )
 
 
@@ -1386,6 +1583,10 @@ async def wiki_merge_maintenance(
             include_concepts = payload.include_concepts,
             similarity_threshold = payload.similarity_threshold,
             max_merges = payload.max_merges,
+            semantic_concept_merge = payload.semantic_concept_merge,
+            semantic_merge_writeback = payload.semantic_merge_writeback,
+            compact_knowledge_pages = payload.compact_knowledge_pages,
+            max_incremental_updates = payload.max_incremental_updates,
         )
     except Exception as exc:
         raise HTTPException(
@@ -1398,6 +1599,15 @@ async def wiki_merge_maintenance(
         dry_run = bool(report.get("dry_run", payload.dry_run)),
         entity_candidates = int(report.get("entity_candidates", 0)),
         concept_candidates = int(report.get("concept_candidates", 0)),
+        semantic_concept_merge_enabled = bool(
+            report.get("semantic_concept_merge_enabled", payload.semantic_concept_merge)
+        ),
+        semantic_merge_writeback_enabled = bool(
+            report.get(
+                "semantic_merge_writeback_enabled", payload.semantic_merge_writeback
+            )
+        ),
+        semantic_concept_candidates = int(report.get("semantic_concept_candidates", 0)),
         scanned_candidates = int(report.get("scanned_candidates", 0)),
         planned_merges = int(report.get("planned_merges", 0)),
         applied_merges = int(report.get("applied_merges", 0)),
@@ -1407,6 +1617,7 @@ async def wiki_merge_maintenance(
         skipped = [dict(item) for item in report.get("skipped", [])],
         merges = [dict(item) for item in report.get("merges", [])],
         errors = [str(item) for item in report.get("errors", [])],
+        knowledge_compaction = dict(report.get("knowledge_compaction", {})),
     )
 
 
@@ -1538,6 +1749,47 @@ async def wiki_lint(
     )
 
 
+@router.get("/wiki/env", response_model = WikiEnvConfigResponse)
+async def wiki_env_config(
+    request: Request,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Return editable wiki runtime environment settings."""
+    return WikiEnvConfigResponse(
+        status = "ok",
+        variables = collect_wiki_env_state(),
+        overrides_file = str(wiki_env_overrides_file()),
+        restart_supported = _restart_supported(request),
+    )
+
+
+@router.post("/wiki/env", response_model = WikiEnvSetResponse)
+async def wiki_env_set(
+    payload: WikiEnvSetRequest,
+    request: Request,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Apply wiki runtime environment edits and optionally restart the backend."""
+    result = update_wiki_env_values(payload.values)
+
+    changed = bool(result.get("updated") or result.get("cleared"))
+    restart_supported = _restart_supported(request)
+    restart_scheduled = False
+    if payload.restart_backend and changed:
+        restart_scheduled = _schedule_backend_restart(request)
+
+    status_value = "partial" if result.get("invalid") else "ok"
+    return WikiEnvSetResponse(
+        status = status_value,
+        updated = [str(item) for item in result.get("updated", [])],
+        cleared = [str(item) for item in result.get("cleared", [])],
+        invalid = dict(result.get("invalid", {})),
+        overrides_file = str(result.get("overrides_file", wiki_env_overrides_file())),
+        restart_supported = restart_supported,
+        restart_scheduled = restart_scheduled,
+    )
+
+
 @router.post(
     "/wiki/export/graphify-wiki",
     response_model = WikiGraphifyExportResponse,
@@ -1624,7 +1876,9 @@ async def load_model(
                     max_context_length = llama_backend.max_context_length,
                     native_context_length = llama_backend.native_context_length,
                     supports_reasoning = llama_backend.supports_reasoning,
+                    reasoning_style = llama_backend.reasoning_style,
                     reasoning_always_on = llama_backend.reasoning_always_on,
+                    supports_preserve_thinking = llama_backend.supports_preserve_thinking,
                     chat_template = llama_backend.chat_template,
                     speculative_type = llama_backend.speculative_type,
                 )
@@ -1646,6 +1900,21 @@ async def load_model(
                     logger.warning(
                         f"Could not retrieve chat template for {backend.active_model_name}: {e}"
                     )
+                # Non-GGUF: only advertise reasoning for gpt-oss Harmony,
+                # which emits reasoning via channels at the tokenizer level.
+                # Template-level chat_template_kwargs (enable_thinking /
+                # preserve_thinking / tools) are not yet forwarded through
+                # the transformers generation path, so avoid advertising
+                # controls the server cannot honour outside GGUF.
+                _sf_supports_reasoning = False
+                _sf_reasoning_style = "enable_thinking"
+                if hasattr(backend, "_is_gpt_oss_model"):
+                    try:
+                        if backend._is_gpt_oss_model():
+                            _sf_supports_reasoning = True
+                            _sf_reasoning_style = "reasoning_effort"
+                    except Exception:
+                        pass
                 return LoadResponse(
                     status = "already_loaded",
                     model = backend.active_model_name,
@@ -1660,6 +1929,11 @@ async def load_model(
                     requires_trust_remote_code = bool(
                         inference_config.get("trust_remote_code", False)
                     ),
+                    supports_reasoning = _sf_supports_reasoning,
+                    reasoning_style = _sf_reasoning_style,
+                    reasoning_always_on = False,
+                    supports_preserve_thinking = False,
+                    supports_tools = False,
                     chat_template = _chat_template,
                 )
 
@@ -1773,7 +2047,9 @@ async def load_model(
                 max_context_length = llama_backend.max_context_length,
                 native_context_length = llama_backend.native_context_length,
                 supports_reasoning = llama_backend.supports_reasoning,
+                reasoning_style = llama_backend.reasoning_style,
                 reasoning_always_on = llama_backend.reasoning_always_on,
+                supports_preserve_thinking = llama_backend.supports_preserve_thinking,
                 supports_tools = llama_backend.supports_tools,
                 cache_type_kv = llama_backend.cache_type_kv,
                 chat_template = llama_backend.chat_template,
@@ -1896,6 +2172,20 @@ async def load_model(
         except Exception:
             pass
 
+        # Non-GGUF: gpt-oss Harmony surfaces reasoning via tokenizer-level
+        # channels; other safetensors reasoning/tools/preserve-thinking
+        # knobs are not forwarded to tokenizer.apply_chat_template yet, so
+        # we only advertise support for the Harmony case here.
+        _sf_supports_reasoning = False
+        _sf_reasoning_style = "enable_thinking"
+        if hasattr(backend, "_is_gpt_oss_model"):
+            try:
+                if backend._is_gpt_oss_model():
+                    _sf_supports_reasoning = True
+                    _sf_reasoning_style = "reasoning_effort"
+            except Exception:
+                pass
+
         return LoadResponse(
             status = "loaded",
             model = config.identifier,
@@ -1910,6 +2200,11 @@ async def load_model(
             requires_trust_remote_code = bool(
                 inference_config.get("trust_remote_code", False)
             ),
+            supports_reasoning = _sf_supports_reasoning,
+            reasoning_style = _sf_reasoning_style,
+            reasoning_always_on = False,
+            supports_preserve_thinking = False,
+            supports_tools = False,
             chat_template = _chat_template,
         )
 
@@ -2117,7 +2412,9 @@ async def get_status(
                     (_inference_cfg or {}).get("trust_remote_code", False)
                 ),
                 supports_reasoning = llama_backend.supports_reasoning,
+                reasoning_style = llama_backend.reasoning_style,
                 reasoning_always_on = llama_backend.reasoning_always_on,
+                supports_preserve_thinking = llama_backend.supports_preserve_thinking,
                 supports_tools = llama_backend.supports_tools,
                 context_length = llama_backend.context_length,
                 max_context_length = llama_backend.max_context_length,
@@ -2139,10 +2436,18 @@ async def get_status(
             audio_type = model_info.get("audio_type")
             has_audio_input = model_info.get("has_audio_input", False)
 
-        # gpt-oss safetensors models support reasoning via harmony channels
+        # Non-GGUF: only gpt-oss Harmony is wired through the transformers
+        # generation path. Other template-level reasoning / tool kwargs
+        # are not yet forwarded, so we do not advertise them here.
         supports_reasoning = False
+        reasoning_style = "enable_thinking"
         if backend.active_model_name and hasattr(backend, "_is_gpt_oss_model"):
-            supports_reasoning = backend._is_gpt_oss_model()
+            try:
+                if backend._is_gpt_oss_model():
+                    supports_reasoning = True
+                    reasoning_style = "reasoning_effort"
+            except Exception:
+                pass
         inference_config = (
             load_inference_config(backend.active_model_name)
             if backend.active_model_name
@@ -2163,6 +2468,10 @@ async def get_status(
                 (inference_config or {}).get("trust_remote_code", False)
             ),
             supports_reasoning = supports_reasoning,
+            reasoning_style = reasoning_style,
+            reasoning_always_on = False,
+            supports_preserve_thinking = False,
+            supports_tools = False,
         )
 
     except Exception as e:
@@ -2386,1295 +2695,28 @@ def _extract_content_parts(
     return system_prompt, chat_messages, first_image_b64
 
 
-def _inject_system_text_into_payload(
-    payload: ChatCompletionRequest,
-    injected_text: str,
-) -> ChatCompletionRequest:
-    """Return a payload copy with injected system text prepended safely."""
-    if not injected_text:
-        return payload
-
-    messages = [m.model_copy(deep = True) for m in payload.messages]
-    if (
-        messages
-        and messages[0].role == "system"
-        and isinstance(messages[0].content, str)
-    ):
-        existing = messages[0].content or ""
-        merged = (
-            existing.rstrip() + "\n\n" + injected_text
-            if existing.strip()
-            else injected_text
-        )
-        messages[0] = messages[0].model_copy(update = {"content": merged})
-    else:
-        messages.insert(0, ChatMessage(role = "system", content = injected_text))
-
-    return payload.model_copy(update = {"messages": messages})
-
-
-def _apply_route_rag_history_hooks_to_payload(
-    payload: ChatCompletionRequest,
-    *,
-    request_label: str,
-) -> ChatCompletionRequest:
-    """Apply route-level wiki ingest + RAG prompt injection for upstream paths."""
-    try:
-        system_prompt, chat_messages, _ = _extract_content_parts(payload.messages)
-        system_prompt_lower = system_prompt.lower().strip() if system_prompt else ""
-        if (
-            "write 1 concise chat title" in system_prompt_lower
-            and "output title only" in system_prompt_lower
-        ):
-            logger.debug(
-                "Skipping %s RAG/wiki-history hooks for auto-title request",
-                request_label,
-            )
-            return payload
-
-        if _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT > 0:
-            _ingest_pending_raw_files(
-                max_files = _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT,
-            )
-
-        if chat_messages:
-            last_user_msg = next(
-                (m for m in reversed(chat_messages) if m.get("role") == "user"),
-                None,
-            )
-            last_user_text = (
-                str(last_user_msg.get("content", "")).strip()
-                if last_user_msg
-                else ""
-            )
-
-            if last_user_text:
-                rag_context, rag_debug = _get_route_rag_context(
-                    last_user_text,
-                    return_debug = True,
-                    debug_source = "last-request",
-                )
-                global _LAST_RAG_DEBUG
-                _LAST_RAG_DEBUG = rag_debug
-                selected_pages = [
-                    str(item.get("page", "unknown"))
-                    for item in rag_debug.get("selected", [])
-                ]
-                ranking_mode = str(
-                    rag_debug.get("ranking_mode", "unknown") or "unknown"
-                )
-                logger.info(
-                    "RAG selection for %s request: rank_mode=%s pages=%d chars=%d selected=%s query=%r",
-                    request_label,
-                    ranking_mode,
-                    len(selected_pages),
-                    len(rag_context),
-                    selected_pages,
-                    last_user_text,
-                )
-
-                if rag_context:
-                    logger.info("Injecting RAG context into %s prompt", request_label)
-                    if _RAG_LOG_INJECTED_CONTEXT:
-                        logger.info(
-                            "Injected RAG context:\n%s",
-                            _loggable_rag_context(rag_context),
-                        )
-                    rag_block = (
-                        "Use the following context to help answer the user's request:\n\n"
-                        f"{rag_context}"
-                    )
-                    payload = _inject_system_text_into_payload(payload, rag_block)
-                else:
-                    logger.info(
-                        "RAG produced empty context for %s request",
-                        request_label,
-                    )
-
-            _save_chat_history_to_route_wiki(chat_messages)
-    except Exception as exc:
-        logger.warning(
-            "Failed to apply %s RAG/wiki history hooks: %s",
-            request_label,
-            exc,
-        )
-
-    return payload
-
-
-def _build_openai_upstream_body(
-    payload: ChatCompletionRequest,
-    model_name: str,
-) -> dict[str, Any]:
-    body = payload.model_dump(exclude_none = True)
-    body["messages"] = _openai_messages_for_passthrough(payload)
-    body["model"] = model_name
-    for field in _UNSLOTH_ONLY_OPENAI_FIELDS:
-        body.pop(field, None)
-    if payload.enable_thinking is not None and _llm_upstream_forward_thinking_enabled():
-        existing = body.get("chat_template_kwargs")
-        chat_template_kwargs = existing if isinstance(existing, dict) else {}
-        chat_template_kwargs["enable_thinking"] = bool(payload.enable_thinking)
-        body["chat_template_kwargs"] = chat_template_kwargs
-
-    # OpenAI SDK's extra_body concept: merge arbitrary provider-specific
-    # fields into the top-level JSON request for upstream providers.
-    extra_body = body.pop("extra_body", None)
-    if isinstance(extra_body, dict):
-        for key, value in extra_body.items():
-            if (
-                key in body
-                and isinstance(body.get(key), dict)
-                and isinstance(value, dict)
-            ):
-                merged = dict(body.get(key) or {})
-                merged.update(value)
-                body[key] = merged
-            else:
-                body[key] = value
-
-    return body
-
-
-def _build_openai_streaming_response_headers() -> dict[str, str]:
-    return {
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
-
-
-def _as_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _openai_sse_chunks_from_non_streaming_payload(
-    payload: dict[str, Any],
-    default_model: str,
-) -> list[str]:
-    completion_id = str(payload.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}")
-    created = _as_int(payload.get("created"), int(time.time()))
-    model = str(payload.get("model") or default_model)
-
-    choices = payload.get("choices")
-    first_choice = choices[0] if isinstance(choices, list) and choices else {}
-    first_choice = first_choice if isinstance(first_choice, dict) else {}
-    message = first_choice.get("message")
-    message = message if isinstance(message, dict) else {}
-
-    content = message.get("content")
-    if content is None:
-        content = ""
-    if not isinstance(content, str):
-        content = str(content)
-
-    finish_reason = first_choice.get("finish_reason")
-    if finish_reason not in {"stop", "length"}:
-        finish_reason = "stop"
-
-    lines: list[str] = []
-
-    role_chunk = ChatCompletionChunk(
-        id = completion_id,
-        created = created,
-        model = model,
-        choices = [
-            ChunkChoice(
-                delta = ChoiceDelta(role = "assistant"),
-                finish_reason = None,
-            )
-        ],
-    )
-    lines.append(f"data: {role_chunk.model_dump_json(exclude_none = True)}\n\n")
-
-    if content:
-        content_chunk = ChatCompletionChunk(
-            id = completion_id,
-            created = created,
-            model = model,
-            choices = [
-                ChunkChoice(
-                    delta = ChoiceDelta(content = content),
-                    finish_reason = None,
-                )
-            ],
-        )
-        lines.append(f"data: {content_chunk.model_dump_json(exclude_none = True)}\n\n")
-
-    final_chunk = ChatCompletionChunk(
-        id = completion_id,
-        created = created,
-        model = model,
-        choices = [
-            ChunkChoice(
-                delta = ChoiceDelta(),
-                finish_reason = finish_reason,
-            )
-        ],
-    )
-    lines.append(f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n")
-
-    usage = payload.get("usage")
-    if isinstance(usage, dict):
-        usage_chunk = ChatCompletionChunk(
-            id = completion_id,
-            created = created,
-            model = model,
-            choices = [],
-            usage = CompletionUsage(
-                prompt_tokens = _as_int(usage.get("prompt_tokens"), 0),
-                completion_tokens = _as_int(usage.get("completion_tokens"), 0),
-                total_tokens = _as_int(usage.get("total_tokens"), 0),
-            ),
-            timings = payload.get("timings")
-            if isinstance(payload.get("timings"), dict)
-            else None,
-        )
-        lines.append(f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n")
-
-    lines.append("data: [DONE]\n\n")
-    return lines
-
-
-def _openai_streaming_response_from_payload(
-    payload: dict[str, Any],
-    default_model: str,
-) -> StreamingResponse:
-    lines = _openai_sse_chunks_from_non_streaming_payload(payload, default_model)
-
-    async def _stream():
-        for line in lines:
-            yield line
-
-    return StreamingResponse(
-        _stream(),
-        media_type = "text/event-stream",
-        headers = _build_openai_streaming_response_headers(),
-    )
-
-
-def _upstream_builtin_tools_for_payload(payload: ChatCompletionRequest) -> list[dict]:
-    from core.inference.tools import ALL_TOOLS
-
-    if payload.enabled_tools is None:
-        return list(ALL_TOOLS)
-    enabled = set(payload.enabled_tools)
-    return [
-        tool
-        for tool in ALL_TOOLS
-        if tool.get("function", {}).get("name") in enabled
-    ]
-
-
-def _upstream_tool_use_nudge(model_name: str, tools_to_use: list[dict]) -> str:
-    _tool_names = {tool.get("function", {}).get("name", "") for tool in tools_to_use}
-    _has_web = "web_search" in _tool_names
-    _has_code = "python" in _tool_names or "terminal" in _tool_names
-
-    _date_line = f"The current date is {_date.today().isoformat()}."
-
-    _model_size_b = _extract_model_size_b(model_name)
-    _is_small_model = _model_size_b is not None and _model_size_b < 9
-
-    if _is_small_model:
-        _web_tips = "Do not repeat the same search query."
-    else:
-        _web_tips = (
-            "When you search and find a relevant URL in the results, "
-            "fetch its full content by calling web_search with the url parameter. "
-            "Do not repeat the same search query. If a search returns "
-            "no useful results, try rephrasing or fetching a result URL directly."
-        )
-    _code_tips = (
-        "Use code execution for math, calculations, data processing, "
-        "or to parse and analyze information from tool results."
-    )
-
-    if _has_web and _has_code:
-        _nudge = (
-            _date_line
-            + " "
-            + "You have access to tools. When appropriate, prefer using "
-            + "tools rather than answering from memory. "
-            + _web_tips
-            + " "
-            + _code_tips
-        )
-    elif _has_code:
-        _nudge = (
-            _date_line
-            + " "
-            + "You have access to tools. When appropriate, prefer using "
-            + "code execution rather than answering from memory. "
-            + _code_tips
-        )
-    elif _has_web:
-        _nudge = (
-            _date_line
-            + " "
-            + "You have access to tools. When appropriate, prefer using "
-            + "web search for up-to-date or uncertain factual "
-            + "information rather than answering from memory. "
-            + _web_tips
-        )
-    else:
-        _nudge = ""
-
-    if _nudge:
-        _nudge += _TOOL_ACTION_NUDGE
-    return _nudge
-
-
-def _inject_tool_nudge_into_openai_messages(messages: list[dict], nudge: str) -> None:
-    if not nudge:
-        return
-    if (
-        messages
-        and messages[0].get("role") == "system"
-        and isinstance(messages[0].get("content"), str)
-    ):
-        messages[0]["content"] = messages[0]["content"].rstrip() + "\n\n" + nudge
-    else:
-        messages.insert(0, {"role": "system", "content": nudge})
-
-
-def _strip_tool_xml_from_assistant_messages(messages: list[dict]) -> None:
-    for msg in messages:
-        if msg.get("role") != "assistant":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            msg["content"] = _TOOL_XML_RE.sub("", content).strip()
-
-
-def _parse_tool_call_arguments(raw_args: Any, auto_heal: bool) -> dict:
-    if isinstance(raw_args, dict):
-        return raw_args
-    if isinstance(raw_args, str):
-        try:
-            parsed = json.loads(raw_args)
-            if isinstance(parsed, dict):
-                return parsed
-            return {"value": parsed}
-        except (json.JSONDecodeError, ValueError):
-            if auto_heal:
-                return {"query": raw_args}
-            return {"raw": raw_args}
-    return {}
-
-
-def _tool_status_text(tool_name: str, arguments: dict) -> str:
-    if tool_name == "web_search":
-        _ws_url = str(arguments.get("url") or "").strip()
-        if _ws_url:
-            _parsed = urlparse(_ws_url)
-            if _parsed.scheme in ("http", "https") and _parsed.hostname:
-                _ws_host = _parsed.hostname
-                if _ws_host.startswith("www."):
-                    _ws_host = _ws_host[4:]
-                return f"Reading: {_ws_host}"
-            return "Reading page..."
-        return f"Searching: {arguments.get('query', '')}"
-    if tool_name == "python":
-        preview = str(arguments.get("code") or "").strip().split("\n")[0][:60]
-        return f"Running Python: {preview}" if preview else "Running Python..."
-    if tool_name == "terminal":
-        cmd_preview = str(arguments.get("command") or "")[:60]
-        return f"Running: {cmd_preview}" if cmd_preview else "Running command..."
-    return f"Calling: {tool_name}"
-
-
-def _valid_finish_reason(value: Any) -> str:
-    return value if value in {"stop", "length"} else "stop"
-
-
-def _build_upstream_tool_loop_request_body(
-    base_body: dict[str, Any],
-    conversation: list[dict],
-    *,
-    tools: Optional[list[dict]] = None,
-    tool_choice: Any = None,
-) -> dict[str, Any]:
-    body = dict(base_body)
-    body["stream"] = False
-    body["messages"] = conversation
-    if tools is None:
-        body.pop("tools", None)
-        body.pop("tool_choice", None)
-        return body
-    body["tools"] = tools
-    if tool_choice is not None:
-        body["tool_choice"] = tool_choice
-    else:
-        body.setdefault("tool_choice", "auto")
-    return body
-
-
-async def _openai_upstream_chat_non_streaming_json_from_body(
-    body: dict[str, Any],
-) -> dict[str, Any]:
-    target_url = f"{_llm_upstream_base_url()}/chat/completions"
-
-    try:
-        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                target_url,
-                json = body,
-                headers = _llm_upstream_headers(),
-            )
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = f"Failed to reach upstream model server: {exc}",
-        )
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code = resp.status_code,
-            detail = f"Upstream model server error: {resp.text[:500]}",
-        )
-
-    try:
-        parsed = resp.json()
-    except Exception as exc:
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = f"Upstream model server returned invalid JSON: {exc}",
-        )
-
-    if not isinstance(parsed, dict):
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = "Upstream model server returned invalid response payload.",
-        )
-    return parsed
-
-
-def _upstream_tool_loop_usage(
-    prompt_tokens: int,
-    completion_tokens: int,
-) -> CompletionUsage:
-    return CompletionUsage(
-        prompt_tokens = max(0, prompt_tokens),
-        completion_tokens = max(0, completion_tokens),
-        total_tokens = max(0, prompt_tokens) + max(0, completion_tokens),
-    )
-
-
-def _upstream_empty_assistant_fallback(last_tool_name: str, last_tool_result: str) -> str:
-    tool_result = (last_tool_result or "").strip()
-    if tool_result:
-        preview = tool_result
-        if len(preview) > 1200:
-            preview = preview[:1200].rstrip() + "..."
-        if last_tool_name:
-            return (
-                f"I could not produce a final answer after calling {last_tool_name}. "
-                "Here is the most recent tool output:\n\n"
-                f"{preview}"
-            )
-        return (
-            "I could not produce a final answer in this attempt. "
-            "Here is the most recent tool output:\n\n"
-            f"{preview}"
-        )
-    return (
-        "I could not generate a final answer for this request. "
-        "Please try again or disable tools for this message."
-    )
-
-
-def _upstream_server_tools_enabled(payload: ChatCompletionRequest) -> bool:
-    if not payload.enable_tools:
+def _looks_like_title_generation_request(
+    system_prompt: str,
+    chat_messages: list[dict],
+) -> bool:
+    prompt = str(system_prompt or "").strip().lower()
+    if not prompt:
         return False
-    max_iters = payload.max_tool_calls_per_message
-    if max_iters is None:
-        return True
-    return max_iters > 0
 
-
-async def _openai_upstream_tool_loop_events(
-    payload: ChatCompletionRequest,
-    model_name: str,
-    *,
-    request: Optional[Request] = None,
-):
-    from core.inference.tools import execute_tool
-
-    tools_to_use = _upstream_builtin_tools_for_payload(payload)
-    if not tools_to_use:
-        raise HTTPException(
-            status_code = 400,
-            detail = "No upstream tools are enabled for this request.",
-        )
-
-    tool_names = {
-        tool.get("function", {}).get("name", "")
-        for tool in tools_to_use
-    }
-
-    base_body = _build_openai_upstream_body(payload, model_name)
-    conversation = list(base_body.get("messages") or [])
-
-    nudge = _upstream_tool_use_nudge(model_name, tools_to_use)
-    _inject_tool_nudge_into_openai_messages(conversation, nudge)
-    _strip_tool_xml_from_assistant_messages(conversation)
-
-    auto_heal = payload.auto_heal_tool_calls if payload.auto_heal_tool_calls is not None else True
-    max_tool_iterations = payload.max_tool_calls_per_message
-    if max_tool_iterations is None:
-        max_tool_iterations = 25
-    max_tool_iterations = max(0, max_tool_iterations)
-
-    completion_tokens_total = 0
-    prompt_tokens_last = 0
-    timings_last: Optional[dict] = None
-    saw_usage = False
-    emitted_any_content = False
-    last_tool_name = ""
-    last_tool_result = ""
-
-    async def _call_step(tools: Optional[list[dict]], tool_choice: Any = None) -> dict[str, Any]:
-        body = _build_upstream_tool_loop_request_body(
-            base_body,
-            conversation,
-            tools = tools,
-            tool_choice = tool_choice,
-        )
-        return await _openai_upstream_chat_non_streaming_json_from_body(body)
-
-    for iteration in range(max_tool_iterations):
-        if request is not None and await request.is_disconnected():
-            return
-
-        response_payload = await _call_step(tools_to_use, tool_choice = "auto")
-
-        usage = response_payload.get("usage")
-        if isinstance(usage, dict):
-            saw_usage = True
-            completion_tokens_total += _as_int(usage.get("completion_tokens"), 0)
-            prompt_tokens_last = _as_int(usage.get("prompt_tokens"), prompt_tokens_last)
-        timings = response_payload.get("timings")
-        if isinstance(timings, dict):
-            timings_last = timings
-
-        choices = response_payload.get("choices")
-        choice = choices[0] if isinstance(choices, list) and choices else {}
-        if not isinstance(choice, dict):
-            choice = {}
-
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            message = {}
-
-        finish_reason = _valid_finish_reason(choice.get("finish_reason"))
-
-        raw_content = message.get("content")
-        content = _openai_text_from_content_parts(raw_content)
-        if not content:
-            content = _openai_text_from_content_parts(message.get("output_text"))
-        if not content and isinstance(choice.get("text"), str):
-            content = str(choice.get("text") or "").strip()
-        if auto_heal and content:
-            content = _TOOL_XML_RE.sub("", content).strip()
-
-        raw_tool_calls = message.get("tool_calls")
-        tool_calls = [
-            tc
-            for tc in (raw_tool_calls if isinstance(raw_tool_calls, list) else [])
-            if isinstance(tc, dict)
-        ]
-
-        assistant_msg: dict[str, Any] = {"role": "assistant"}
-        if raw_content is not None:
-            assistant_msg["content"] = raw_content
-        elif tool_calls:
-            assistant_msg["content"] = None
-        else:
-            assistant_msg["content"] = ""
-        if (
-            "reasoning_content" in message
-            and message.get("reasoning_content") is not None
-        ):
-            # Some providers require replaying prior reasoning traces on
-            # subsequent tool-loop turns when thinking mode is enabled.
-            assistant_msg["reasoning_content"] = message.get("reasoning_content")
-        if tool_calls:
-            assistant_msg["tool_calls"] = tool_calls
-        conversation.append(assistant_msg)
-
-        if content:
-            yield {"type": "content", "text": content}
-            emitted_any_content = True
-
-        if not tool_calls:
-            if not emitted_any_content:
-                fallback_text = _upstream_empty_assistant_fallback(
-                    last_tool_name,
-                    last_tool_result,
-                )
-                yield {"type": "content", "text": fallback_text}
-                emitted_any_content = True
-            yield {
-                "type": "final",
-                "finish_reason": finish_reason,
-                "usage": _upstream_tool_loop_usage(prompt_tokens_last, completion_tokens_total)
-                if saw_usage
-                else None,
-                "timings": timings_last,
-            }
-            return
-
-        for idx, tc in enumerate(tool_calls):
-            if request is not None and await request.is_disconnected():
-                return
-
-            func = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-            tool_name = str(func.get("name") or "").strip()
-            raw_args = func.get("arguments", {})
-            arguments = _parse_tool_call_arguments(raw_args, auto_heal = auto_heal)
-            tool_call_id = str(tc.get("id") or f"call_{iteration}_{idx}")
-
-            yield {"type": "status", "text": _tool_status_text(tool_name, arguments)}
-            yield {
-                "type": "tool_start",
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "arguments": arguments,
-            }
-
-            timeout_value = payload.tool_call_timeout if payload.tool_call_timeout is not None else 300
-            effective_timeout = None if timeout_value >= 9999 else timeout_value
-
-            if tool_name not in tool_names:
-                result = f"Tool '{tool_name}' is not enabled for this request."
-            else:
-                try:
-                    result = execute_tool(
-                        tool_name,
-                        arguments,
-                        cancel_event = None,
-                        timeout = effective_timeout,
-                        session_id = payload.session_id,
-                    )
-                except Exception as exc:
-                    result = f"Error executing {tool_name}: {exc}"
-
-            if not isinstance(result, str):
-                result = str(result)
-
-            yield {
-                "type": "tool_end",
-                "tool_name": tool_name,
-                "tool_call_id": tool_call_id,
-                "result": result,
-            }
-
-            last_tool_name = tool_name
-            tool_result_for_model = result
-            if "\n__IMAGES__:" in tool_result_for_model:
-                tool_result_for_model = tool_result_for_model.rsplit("\n__IMAGES__:", 1)[0]
-            last_tool_result = tool_result_for_model
-
-            tool_msg: dict[str, Any] = {
-                "role": "tool",
-                "name": tool_name,
-                "content": tool_result_for_model,
-                "tool_call_id": tool_call_id,
-            }
-            conversation.append(tool_msg)
-
-        yield {"type": "status", "text": ""}
-
-    # Tool budget reached: force final answer without more tool calls.
-    conversation.append(
-        {
-            "role": "user",
-            "content": (
-                "You have used all available tool calls. Based on everything you "
-                "have found so far, provide your final answer now. Do not call any "
-                "more tools."
-            ),
-        }
-    )
-
-    if request is not None and await request.is_disconnected():
-        return
-
-    response_payload = await _call_step([], tool_choice = "none")
-
-    usage = response_payload.get("usage")
-    if isinstance(usage, dict):
-        saw_usage = True
-        completion_tokens_total += _as_int(usage.get("completion_tokens"), 0)
-        prompt_tokens_last = _as_int(usage.get("prompt_tokens"), prompt_tokens_last)
-    timings = response_payload.get("timings")
-    if isinstance(timings, dict):
-        timings_last = timings
-
-    choices = response_payload.get("choices")
-    choice = choices[0] if isinstance(choices, list) and choices else {}
-    if not isinstance(choice, dict):
-        choice = {}
-
-    message = choice.get("message")
-    if not isinstance(message, dict):
-        message = {}
-
-    finish_reason = _valid_finish_reason(choice.get("finish_reason"))
-
-    content = _openai_text_from_content_parts(message.get("content"))
-    if not content:
-        content = _openai_text_from_content_parts(message.get("output_text"))
-    if not content and isinstance(choice.get("text"), str):
-        content = str(choice.get("text") or "").strip()
-    if auto_heal and content:
-        content = _TOOL_XML_RE.sub("", content).strip()
-    if not content:
-        content = _upstream_empty_assistant_fallback(last_tool_name, last_tool_result)
-    if content:
-        yield {"type": "content", "text": content}
-        emitted_any_content = True
-
-    yield {
-        "type": "final",
-        "finish_reason": finish_reason,
-        "usage": _upstream_tool_loop_usage(prompt_tokens_last, completion_tokens_total)
-        if saw_usage
-        else None,
-        "timings": timings_last,
-    }
-
-
-async def _openai_upstream_chat_tools_stream(
-    request: Request,
-    payload: ChatCompletionRequest,
-    model_name: str,
-):
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
-
-    async def _stream():
-        try:
-            first_chunk = ChatCompletionChunk(
-                id = completion_id,
-                created = created,
-                model = model_name,
-                choices = [
-                    ChunkChoice(
-                        delta = ChoiceDelta(role = "assistant"),
-                        finish_reason = None,
-                    )
-                ],
-            )
-            yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\n\n"
-
-            async for event in _openai_upstream_tool_loop_events(
-                payload,
-                model_name,
-                request = request,
-            ):
-                event_type = event.get("type")
-                if event_type == "status":
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {
-                                "type": "tool_status",
-                                "content": str(event.get("text") or ""),
-                            }
-                        )
-                        + "\n\n"
-                    )
-                    continue
-                if event_type in {"tool_start", "tool_end"}:
-                    yield f"data: {json.dumps(event)}\n\n"
-                    continue
-                if event_type == "content":
-                    chunk = ChatCompletionChunk(
-                        id = completion_id,
-                        created = created,
-                        model = model_name,
-                        choices = [
-                            ChunkChoice(
-                                delta = ChoiceDelta(content = str(event.get("text") or "")),
-                                finish_reason = None,
-                            )
-                        ],
-                    )
-                    yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
-                    continue
-                if event_type == "final":
-                    final_chunk = ChatCompletionChunk(
-                        id = completion_id,
-                        created = created,
-                        model = model_name,
-                        choices = [
-                            ChunkChoice(
-                                delta = ChoiceDelta(),
-                                finish_reason = _valid_finish_reason(event.get("finish_reason")),
-                            )
-                        ],
-                    )
-                    yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
-
-                    usage = event.get("usage")
-                    timings = event.get("timings")
-                    if usage or timings:
-                        usage_chunk = ChatCompletionChunk(
-                            id = completion_id,
-                            created = created,
-                            model = model_name,
-                            choices = [],
-                            usage = usage if isinstance(usage, CompletionUsage) else None,
-                            timings = timings if isinstance(timings, dict) else None,
-                        )
-                        yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n"
-
-                    yield "data: [DONE]\n\n"
-                    return
-
-            # Safety fallback if loop exits without explicit final event.
-            final_chunk = ChatCompletionChunk(
-                id = completion_id,
-                created = created,
-                model = model_name,
-                choices = [
-                    ChunkChoice(
-                        delta = ChoiceDelta(),
-                        finish_reason = "stop",
-                    )
-                ],
-            )
-            yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
-            yield "data: [DONE]\n\n"
-        except HTTPException as exc:
-            err = {
-                "error": {
-                    "message": str(exc.detail),
-                    "type": "server_error",
-                }
-            }
-            yield f"data: {json.dumps(err)}\n\n"
-        except Exception as exc:
-            logger.error("openai upstream server-tools stream error: %s", exc)
-            err = {
-                "error": {
-                    "message": f"Failed to run upstream tool loop: {exc}",
-                    "type": "server_error",
-                }
-            }
-            yield f"data: {json.dumps(err)}\n\n"
-
-    return StreamingResponse(
-        _stream(),
-        media_type = "text/event-stream",
-        headers = _build_openai_streaming_response_headers(),
-    )
-
-
-async def _openai_upstream_chat_tools_non_streaming(
-    payload: ChatCompletionRequest,
-    model_name: str,
-):
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
-    final_text_parts: list[str] = []
-    final_finish_reason = "stop"
-    final_usage: Optional[CompletionUsage] = None
-
-    async for event in _openai_upstream_tool_loop_events(payload, model_name):
-        event_type = event.get("type")
-        if event_type == "content":
-            final_text_parts.append(str(event.get("text") or ""))
-            continue
-        if event_type == "final":
-            final_finish_reason = _valid_finish_reason(event.get("finish_reason"))
-            usage = event.get("usage")
-            if isinstance(usage, CompletionUsage):
-                final_usage = usage
-
-    response = ChatCompletion(
-        id = completion_id,
-        created = created,
-        model = model_name,
-        choices = [
-            CompletionChoice(
-                message = CompletionMessage(content = "".join(final_text_parts)),
-                finish_reason = final_finish_reason,
-            )
-        ],
-        usage = final_usage or CompletionUsage(),
-    )
-    return JSONResponse(content = response.model_dump())
-
-
-def _parse_openai_non_streaming_payload(raw_payload: bytes) -> dict[str, Any]:
-    try:
-        parsed = json.loads(raw_payload.decode("utf-8"))
-    except Exception as exc:
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = f"Upstream non-streaming fallback returned invalid JSON: {exc}",
-        )
-    if not isinstance(parsed, dict):
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = "Upstream non-streaming fallback returned invalid payload.",
-        )
-    return parsed
-
-
-async def _openai_upstream_chat_non_streaming_raw(
-    payload: ChatCompletionRequest,
-    model_name: str,
-) -> bytes:
-    target_url = f"{_llm_upstream_base_url()}/chat/completions"
-    body = _build_openai_upstream_body(payload, model_name)
-    body["stream"] = False
-
-    try:
-        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                target_url,
-                json = body,
-                headers = _llm_upstream_headers(),
-            )
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = f"Failed to reach upstream model server: {exc}",
-        )
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code = resp.status_code,
-            detail = f"Upstream model server error: {resp.text[:500]}",
-        )
-
-    return resp.content
-
-
-async def _openai_upstream_stream_via_non_streaming(
-    payload: ChatCompletionRequest,
-    model_name: str,
-) -> StreamingResponse:
-    raw_payload = await _openai_upstream_chat_non_streaming_raw(payload, model_name)
-    parsed = _parse_openai_non_streaming_payload(raw_payload)
-    return _openai_streaming_response_from_payload(parsed, model_name)
-
-
-async def _openai_upstream_chat_stream(
-    request: Request,
-    payload: ChatCompletionRequest,
-    model_name: str,
-):
-    fallback_enabled = _llm_upstream_auto_stream_fallback_enabled(
-        payload.upstream_auto_stream_fallback,
-    )
-    if (
-        fallback_enabled
-        and payload.enable_thinking
-        and _known_upstream_stream_thinking_compat(model_name) is False
-    ):
-        logger.info(
-            "Upstream stream fallback pre-check triggered for model=%s",
-            model_name,
-        )
-        return await _openai_upstream_stream_via_non_streaming(payload, model_name)
-
-    target_url = f"{_llm_upstream_base_url()}/chat/completions"
-    body = _build_openai_upstream_body(payload, model_name)
-    body["stream"] = True
-
-    client = httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS)
-    resp = None
-    try:
-        req = client.build_request(
-            "POST",
-            target_url,
-            json = body,
-            headers = _llm_upstream_headers(),
-        )
-        resp = await client.send(req, stream = True)
-    except httpx.RequestError as exc:
-        if resp is not None:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = f"Failed to reach upstream model server: {exc}",
-        )
-
-    if resp.status_code != 200:
-        err_bytes = await resp.aread()
-        err_text = err_bytes.decode("utf-8", errors = "replace")
-        upstream_status = resp.status_code
-        try:
-            await resp.aclose()
-        except Exception:
-            pass
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        raise HTTPException(
-            status_code = upstream_status,
-            detail = f"Upstream model server error: {err_text[:500]}",
-        )
-
-    content_type = str(resp.headers.get("content-type", "")).lower()
-    if "text/event-stream" not in content_type:
-        logger.warning(
-            "Upstream stream requested but server returned non-SSE content-type=%s; "
-            "falling back to non-streaming payload conversion.",
-            content_type or "<missing>",
-        )
-        try:
-            raw_payload = await resp.aread()
-            parsed = _parse_openai_non_streaming_payload(raw_payload)
-            return _openai_streaming_response_from_payload(parsed, model_name)
-        finally:
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-
-    async def _stream():
-        lines_iter = None
-        saw_data_line = False
-        saw_done = False
-        client_disconnected = False
-        try:
-            lines_iter = resp.aiter_lines()
-            async for raw_line in lines_iter:
-                if await request.is_disconnected():
-                    client_disconnected = True
-                    break
-                if not raw_line:
-                    continue
-                if not raw_line.startswith("data: "):
-                    continue
-                saw_data_line = True
-                yield raw_line + "\n\n"
-                if raw_line[6:].strip() == "[DONE]":
-                    saw_done = True
-                    break
-            if client_disconnected:
-                return
-            if not saw_data_line:
-                logger.warning(
-                    "Upstream stream completed with no SSE data lines for model=%s; "
-                    "falling back to non-streaming for this request.",
-                    model_name,
-                )
-                if payload.enable_thinking and fallback_enabled:
-                    _remember_upstream_stream_thinking_compat(model_name, False)
-                try:
-                    raw_payload = await _openai_upstream_chat_non_streaming_raw(
-                        payload,
-                        model_name,
-                    )
-                    parsed = _parse_openai_non_streaming_payload(raw_payload)
-                    for line in _openai_sse_chunks_from_non_streaming_payload(
-                        parsed,
-                        model_name,
-                    ):
-                        yield line
-                    return
-                except Exception as fallback_exc:
-                    logger.error(
-                        "Upstream no-data stream fallback failed: %s",
-                        fallback_exc,
-                    )
-                    err = {
-                        "error": {
-                            "message": (
-                                "Upstream stream returned no tokens and fallback failed: "
-                                f"{fallback_exc}"
-                            ),
-                            "type": "server_error",
-                        },
-                    }
-                    yield f"data: {json.dumps(err)}\n\n"
-                    return
-            if payload.enable_thinking and fallback_enabled and saw_done:
-                _remember_upstream_stream_thinking_compat(model_name, True)
-        except Exception as exc:
-            logger.error("openai upstream stream error: %s", exc)
-            if payload.enable_thinking and fallback_enabled and not saw_data_line:
-                _remember_upstream_stream_thinking_compat(model_name, False)
-                logger.warning(
-                    "Upstream stream failed before first token for model=%s; "
-                    "falling back to non-streaming for this request.",
-                    model_name,
-                )
-                try:
-                    raw_payload = await _openai_upstream_chat_non_streaming_raw(
-                        payload,
-                        model_name,
-                    )
-                    parsed = _parse_openai_non_streaming_payload(raw_payload)
-                    for line in _openai_sse_chunks_from_non_streaming_payload(
-                        parsed,
-                        model_name,
-                    ):
-                        yield line
-                    return
-                except Exception as fallback_exc:
-                    logger.error(
-                        "Upstream non-streaming fallback failed: %s",
-                        fallback_exc,
-                    )
-            err = {
-                "error": {
-                    "message": f"Failed to stream from upstream model server: {exc}",
-                    "type": "server_error",
-                },
-            }
-            yield f"data: {json.dumps(err)}\n\n"
-        finally:
-            if lines_iter is not None:
-                try:
-                    await lines_iter.aclose()
-                except Exception:
-                    pass
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-
-    return StreamingResponse(
-        _stream(),
-        media_type = "text/event-stream",
-        headers = _build_openai_streaming_response_headers(),
-    )
-
-
-async def _openai_upstream_chat_non_streaming(
-    payload: ChatCompletionRequest,
-    model_name: str,
-):
-    raw_payload = await _openai_upstream_chat_non_streaming_raw(payload, model_name)
-    return Response(content = raw_payload, media_type = "application/json")
-
-
-async def _openai_upstream_passthrough(
-    request: Request,
-    endpoint: str,
-    *,
-    allow_stream: bool,
-):
-    body = await request.json()
-    target_url = f"{_llm_upstream_base_url()}/{endpoint.lstrip('/')}"
-    wants_stream = bool(body.get("stream", False)) if allow_stream else False
-
-    if wants_stream:
-        client = httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS)
-        resp = None
-        try:
-            req = client.build_request(
-                "POST",
-                target_url,
-                json = body,
-                headers = _llm_upstream_headers(),
-            )
-            resp = await client.send(req, stream = True)
-        except httpx.RequestError as exc:
-            if resp is not None:
-                try:
-                    await resp.aclose()
-                except Exception:
-                    pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-            raise HTTPException(
-                status_code = status.HTTP_502_BAD_GATEWAY,
-                detail = f"Failed to reach upstream model server: {exc}",
-            )
-
-        if resp.status_code != 200:
-            err_bytes = await resp.aread()
-            err_text = err_bytes.decode("utf-8", errors = "replace")
-            upstream_status = resp.status_code
-            try:
-                await resp.aclose()
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-            raise HTTPException(
-                status_code = upstream_status,
-                detail = f"Upstream model server error: {err_text[:500]}",
-            )
-
-        async def _stream():
-            bytes_iter = None
-            try:
-                bytes_iter = resp.aiter_bytes()
-                async for chunk in bytes_iter:
-                    if await request.is_disconnected():
-                        break
-                    if chunk:
-                        yield chunk
-            except Exception as exc:
-                logger.error("openai upstream %s stream error: %s", endpoint, exc)
-            finally:
-                if bytes_iter is not None:
-                    try:
-                        await bytes_iter.aclose()
-                    except Exception:
-                        pass
-                try:
-                    await resp.aclose()
-                except Exception:
-                    pass
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-
-        return StreamingResponse(_stream(), media_type = "text/event-stream")
-
-    try:
-        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                target_url,
-                json = body,
-                headers = _llm_upstream_headers(),
-            )
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = f"Failed to reach upstream model server: {exc}",
-        )
-
-    return Response(
-        content = resp.content,
-        status_code = resp.status_code,
-        media_type = "application/json",
-    )
+    # Frontend auto-title requests use this explicit instruction template.
+    if "write 1 concise chat title for the user's message" not in prompt:
+        return False
+    if "output title only" not in prompt:
+        return False
+
+    # Keep detection strict so ordinary user requests that mention "title"
+    # still receive normal RAG behavior.
+    user_messages = [
+        msg
+        for msg in chat_messages
+        if str(msg.get("role", "")) == "user" and str(msg.get("content", "")).strip()
+    ]
+    return len(chat_messages) <= 2 and len(user_messages) == 1
 
 
 @router.post("/chat/completions")
@@ -3990,59 +3032,74 @@ async def openai_chat_completions(
                 )
 
         # RAG context + chat history persistence for GGUF path.
+        is_title_generation_request = _looks_like_title_generation_request(
+            system_prompt,
+            chat_messages,
+        )
         try:
-            if _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT > 0:
-                _ingest_pending_raw_files(
-                    max_files = _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT,
+            if is_title_generation_request:
+                logger.debug(
+                    "Skipping GGUF RAG/wiki-history hooks for auto-title request"
                 )
-            if chat_messages:
-                last_user_msg = next(
-                    (m for m in reversed(chat_messages) if m.get("role") == "user"),
-                    None,
-                )
-                last_user_text = (
-                    str(last_user_msg.get("content", "")).strip()
-                    if last_user_msg
-                    else ""
-                )
-                if last_user_text:
-                    rag_context, rag_debug = _get_route_rag_context(
-                        last_user_text,
-                        return_debug = True,
-                        debug_source = "last-request",
+            else:
+                if _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT > 0:
+                    _ingest_pending_raw_files(
+                        max_files = _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT,
                     )
-                    global _LAST_RAG_DEBUG
-                    _LAST_RAG_DEBUG = rag_debug
-                    selected_pages = [
-                        str(item.get("page", "unknown"))
-                        for item in rag_debug.get("selected", [])
-                    ]
-                    logger.info(
-                        "RAG selection for GGUF request: pages=%d chars=%d selected=%s query=%r",
-                        len(selected_pages),
-                        len(rag_context),
-                        selected_pages,
-                        last_user_text,
+                if chat_messages:
+                    last_user_msg = next(
+                        (m for m in reversed(chat_messages) if m.get("role") == "user"),
+                        None,
                     )
-                    if rag_context:
-                        logger.info("Injecting RAG context into GGUF prompt")
-                        if _RAG_LOG_INJECTED_CONTEXT:
-                            logger.info(
-                                "Injected RAG context:\n%s",
-                                _loggable_rag_context(rag_context),
-                            )
-                        rag_block = (
-                            "Use the following context to help answer the user's request:\n\n"
-                            f"{rag_context}"
+                    last_user_text = (
+                        str(last_user_msg.get("content", "")).strip()
+                        if last_user_msg
+                        else ""
+                    )
+                    if last_user_text:
+                        rag_context, rag_debug = _get_route_rag_context(
+                            last_user_text,
+                            return_debug = True,
+                            debug_source = "last-request",
                         )
-                        if system_prompt:
-                            system_prompt = system_prompt.rstrip() + "\n\n" + rag_block
+                        global _LAST_RAG_DEBUG
+                        _LAST_RAG_DEBUG = rag_debug
+                        selected_pages = [
+                            str(item.get("page", "unknown"))
+                            for item in rag_debug.get("selected", [])
+                        ]
+                        ranking_mode = str(
+                            rag_debug.get("ranking_mode", "unknown") or "unknown"
+                        )
+                        logger.info(
+                            "RAG selection for GGUF request: rank_mode=%s pages=%d chars=%d selected=%s query=%r",
+                            ranking_mode,
+                            len(selected_pages),
+                            len(rag_context),
+                            selected_pages,
+                            last_user_text,
+                        )
+                        if rag_context:
+                            logger.info("Injecting RAG context into GGUF prompt")
+                            if _RAG_LOG_INJECTED_CONTEXT:
+                                logger.info(
+                                    "Injected RAG context:\n%s",
+                                    _loggable_rag_context(rag_context),
+                                )
+                            rag_block = (
+                                "Use the following context to help answer the user's request:\n\n"
+                                f"{rag_context}"
+                            )
+                            if system_prompt:
+                                system_prompt = (
+                                    system_prompt.rstrip() + "\n\n" + rag_block
+                                )
+                            else:
+                                system_prompt = rag_block
                         else:
-                            system_prompt = rag_block
-                    else:
-                        logger.info("RAG produced empty context for GGUF request")
+                            logger.info("RAG produced empty context for GGUF request")
 
-                _save_chat_history_to_route_wiki(chat_messages)
+                    _save_chat_history_to_route_wiki(chat_messages)
         except Exception as e:
             logger.warning(f"Failed to apply GGUF RAG/wiki history hooks: {e}")
 
@@ -4160,6 +3217,8 @@ async def openai_chat_completions(
                     presence_penalty = payload.presence_penalty,
                     cancel_event = cancel_event,
                     enable_thinking = payload.enable_thinking,
+                    reasoning_effort = payload.reasoning_effort,
+                    preserve_thinking = payload.preserve_thinking,
                     auto_heal_tool_calls = payload.auto_heal_tool_calls
                     if payload.auto_heal_tool_calls is not None
                     else True,
@@ -4329,6 +3388,8 @@ async def openai_chat_completions(
                 presence_penalty = payload.presence_penalty,
                 cancel_event = cancel_event,
                 enable_thinking = payload.enable_thinking,
+                reasoning_effort = payload.reasoning_effort,
+                preserve_thinking = payload.preserve_thinking,
             )
 
         _gguf_sentinel = object()
@@ -5681,6 +4742,64 @@ async def openai_responses(
 # =====================================================================
 
 
+def _normalize_anthropic_openai_images(
+    openai_messages: list[dict], is_vision: bool
+) -> bool:
+    """Enforce the vision guard on translated Anthropic messages and
+    normalize any ``image_url`` parts with base64 data URLs to PNG.
+
+    llama-server's stb_image only handles a few formats (JPEG/PNG/BMP/…);
+    Anthropic clients commonly send JPEG or WebP, and Claude Code sends
+    WebP. Re-encoding everything to PNG mirrors the behavior of
+    `_openai_messages_for_passthrough` / the GGUF branch of
+    `/v1/chat/completions` so the two endpoints agree.
+
+    Mutates ``openai_messages`` in place. Returns ``True`` when any
+    image part was seen (so the caller can skip a second scan). Raises
+    HTTPException(400) when images are present but the active model is
+    not a vision model, or when an image cannot be decoded.
+    """
+    from PIL import Image
+
+    has_image = False
+    for msg in openai_messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part.get("type") != "image_url":
+                continue
+
+            has_image = True
+            if not is_vision:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Image provided but current GGUF model does not support vision.",
+                )
+
+            url = (part.get("image_url") or {}).get("url", "")
+            if not url.startswith("data:"):
+                # Remote URLs are forwarded as-is; llama-server will
+                # fetch (or fail) per its own support matrix.
+                continue
+
+            try:
+                _, b64data = url.split(",", 1)
+                raw = base64.b64decode(b64data)
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format = "PNG")
+                png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception as e:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = f"Failed to process image: {e}",
+                )
+            part["image_url"] = {"url": f"data:image/png;base64,{png_b64}"}
+
+    return has_image
+
+
 @router.post("/messages")
 async def anthropic_messages(
     payload: AnthropicMessagesRequest,
@@ -5711,6 +4830,12 @@ async def anthropic_messages(
         payload.system,
     )
 
+    # Enforce vision guard + re-encode embedded images to PNG so the
+    # Anthropic endpoint matches the behavior of /v1/chat/completions.
+    _has_image = _normalize_anthropic_openai_images(
+        openai_messages, llama_backend.is_vision
+    )
+
     temperature = payload.temperature if payload.temperature is not None else 0.6
     top_p = payload.top_p if payload.top_p is not None else 0.95
     top_k = payload.top_k if payload.top_k is not None else 20
@@ -5737,9 +4862,10 @@ async def anthropic_messages(
     # 1. enable_tools=true → server-side execution of built-in tools (Unsloth shorthand)
     # 2. tools=[...] only  → client-side pass-through (standard Anthropic behavior)
     # 3. neither           → plain chat
+    # Server-side agentic loop doesn't support multimodal input — matches
+    # the `not image_b64` gate in /v1/chat/completions.
     server_tools = (
-        payload.enable_tools
-        and llama_backend.supports_tools
+        payload.enable_tools and llama_backend.supports_tools and not _has_image
     )
     client_tools = (
         not server_tools

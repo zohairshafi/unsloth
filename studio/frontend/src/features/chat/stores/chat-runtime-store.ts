@@ -19,6 +19,22 @@ const MAX_TOOL_CALLS_KEY = "unsloth_max_tool_calls_per_message";
 const TOOL_CALL_TIMEOUT_KEY = "unsloth_tool_call_timeout";
 const HF_TOKEN_KEY = "unsloth_hf_token";
 const INFERENCE_PARAMS_KEY = "unsloth_chat_inference_params";
+const REASONING_EFFORT_KEY = "unsloth_reasoning_effort";
+const PRESERVE_THINKING_KEY = "unsloth_preserve_thinking";
+
+export type ReasoningStyle = "enable_thinking" | "reasoning_effort";
+export type ReasoningEffort = "low" | "medium" | "high";
+
+function loadReasoningEffort(fallback: ReasoningEffort): ReasoningEffort {
+  if (!canUseStorage()) return fallback;
+  try {
+    const raw = localStorage.getItem(REASONING_EFFORT_KEY);
+    if (raw === "low" || raw === "medium" || raw === "high") return raw;
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
 let hasShownInferencePersistenceWarning = false;
 
 function canUseStorage(): boolean {
@@ -163,7 +179,10 @@ type ChatRuntimeStore = {
   supportsReasoning: boolean;
   reasoningAlwaysOn: boolean;
   reasoningEnabled: boolean;
-  reasoningEffortHigh: boolean;
+  reasoningStyle: ReasoningStyle;
+  reasoningEffort: ReasoningEffort;
+  supportsPreserveThinking: boolean;
+  preserveThinking: boolean;
   supportsTools: boolean;
   toolsEnabled: boolean;
   codeToolsEnabled: boolean;
@@ -208,7 +227,9 @@ type ChatRuntimeStore = {
   setSettingsPanelOpen: (open: boolean) => void;
   clearCheckpoint: () => void;
   setReasoningEnabled: (enabled: boolean) => void;
-  setReasoningEffortHigh: (enabled: boolean) => void;
+  setReasoningStyle: (style: ReasoningStyle) => void;
+  setReasoningEffort: (effort: ReasoningEffort) => void;
+  setPreserveThinking: (value: boolean) => void;
   setToolsEnabled: (enabled: boolean) => void;
   setCodeToolsEnabled: (enabled: boolean) => void;
   setToolStatus: (status: string | null) => void;
@@ -246,7 +267,10 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   supportsReasoning: false,
   reasoningAlwaysOn: false,
   reasoningEnabled: true,
-  reasoningEffortHigh: loadBool(REASONING_EFFORT_HIGH_KEY, false),
+  reasoningStyle: "enable_thinking",
+  reasoningEffort: loadReasoningEffort("medium"),
+  supportsPreserveThinking: false,
+  preserveThinking: loadBool(PRESERVE_THINKING_KEY, false),
   supportsTools: false,
   toolsEnabled: initialUseUpstream,
   codeToolsEnabled: initialUseUpstream,
@@ -360,7 +384,10 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       modelRequiresTrustRemoteCode: false,
       contextUsage: null,
       supportsReasoning: false,
+      reasoningAlwaysOn: false,
       reasoningEnabled: true,
+      reasoningStyle: "enable_thinking",
+      supportsPreserveThinking: false,
       supportsTools: false,
       toolsEnabled: false,
       codeToolsEnabled: false,
@@ -374,10 +401,22 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       chatTemplateOverride: null,
     })),
   setReasoningEnabled: (reasoningEnabled) => set({ reasoningEnabled }),
-  setReasoningEffortHigh: (reasoningEffortHigh) =>
+  setReasoningStyle: (reasoningStyle) => set({ reasoningStyle }),
+  setReasoningEffort: (reasoningEffort) =>
     set(() => {
-      saveBool(REASONING_EFFORT_HIGH_KEY, reasoningEffortHigh);
-      return { reasoningEffortHigh };
+      if (canUseStorage()) {
+        try {
+          localStorage.setItem(REASONING_EFFORT_KEY, reasoningEffort);
+        } catch {
+          // ignore
+        }
+      }
+      return { reasoningEffort };
+    }),
+  setPreserveThinking: (preserveThinking) =>
+    set(() => {
+      saveBool(PRESERVE_THINKING_KEY, preserveThinking);
+      return { preserveThinking };
     }),
   setToolsEnabled: (toolsEnabled) => set({ toolsEnabled }),
   setCodeToolsEnabled: (codeToolsEnabled) => set({ codeToolsEnabled }),
