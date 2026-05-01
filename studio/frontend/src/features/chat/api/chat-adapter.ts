@@ -628,6 +628,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       const reasoningCapable = runtime.supportsReasoning || useUpstream;
       const toolCapable = supportsTools || useUpstream;
       const reasoningEnabled = runtime.reasoningEnabled;
+      const reasoningEffortHigh = runtime.reasoningEffortHigh;
 
       const outboundMessages = messages
         .map(toOpenAIMessage)
@@ -774,6 +775,18 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
             ...(reasoningCapable
               ? { enable_thinking: reasoningEnabled }
+              : {}),
+            ...(useUpstream && reasoningCapable
+              ? {
+                  // Provider-specific thinking mode shape used by upstream
+                  // models such as DeepSeek.
+                  extra_body: {
+                    thinking: { type: reasoningEnabled ? "enabled" : "disabled" },
+                  },
+                }
+              : {}),
+            ...(useUpstream && reasoningCapable && reasoningEnabled && reasoningEffortHigh
+              ? { reasoning_effort: "high" as const }
               : {}),
             ...(toolCapable && (toolsEnabled || codeToolsEnabled)
               ? {

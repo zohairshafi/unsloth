@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { AUDIO_ACCEPT, MAX_AUDIO_SIZE, fileToBase64 } from "@/lib/audio-utils";
 import { useAui } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
-import { ArrowUpIcon, GlobeIcon, HeadphonesIcon, LightbulbIcon, LightbulbOffIcon, MicIcon, PlusIcon, SquareIcon, XIcon } from "lucide-react";
+import { ArrowUpIcon, GaugeIcon, GlobeIcon, HeadphonesIcon, LightbulbIcon, LightbulbOffIcon, MicIcon, PlusIcon, SquareIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import { loadModel, validateModel } from "./api/chat-api";
 import { useChatRuntimeStore } from "./stores/chat-runtime-store";
@@ -246,6 +246,8 @@ export function SharedComposer({
   const reasoningAlwaysOn = useChatRuntimeStore((s) => s.reasoningAlwaysOn);
   const reasoningEnabled = useChatRuntimeStore((s) => s.reasoningEnabled);
   const setReasoningEnabled = useChatRuntimeStore((s) => s.setReasoningEnabled);
+  const reasoningEffortHigh = useChatRuntimeStore((s) => s.reasoningEffortHigh);
+  const setReasoningEffortHigh = useChatRuntimeStore((s) => s.setReasoningEffortHigh);
   const supportsTools = useChatRuntimeStore((s) => s.supportsTools);
   const toolsEnabled = useChatRuntimeStore((s) => s.toolsEnabled);
   const setToolsEnabled = useChatRuntimeStore((s) => s.setToolsEnabled);
@@ -253,6 +255,8 @@ export function SharedComposer({
   const setCodeToolsEnabled = useChatRuntimeStore((s) => s.setCodeToolsEnabled);
   const controlsReady = modelLoaded || useUpstream;
   const reasoningDisabled = !controlsReady || (!useUpstream && !supportsReasoning);
+  const reasoningEffortDisabled =
+    !useUpstream || reasoningDisabled || !(reasoningEnabled || reasoningAlwaysOn);
   const toolsDisabled = !controlsReady || (!useUpstream && !supportsTools);
   const setPendingAudioStore = useChatRuntimeStore((s) => s.setPendingAudio);
   const clearPendingAudioStore = useChatRuntimeStore((s) => s.clearPendingAudio);
@@ -604,6 +608,29 @@ export function SharedComposer({
             )}
             <span>Think</span>
           </button>
+          {useUpstream && (
+            <button
+              type="button"
+              disabled={reasoningEffortDisabled}
+              onClick={() => setReasoningEffortHigh(!reasoningEffortHigh)}
+              className={cn(
+                "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+                reasoningEffortDisabled
+                  ? "cursor-not-allowed opacity-40"
+                  : reasoningEffortHigh
+                    ? "bg-primary/10 text-primary hover:bg-primary/20"
+                    : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+              )}
+              aria-label={
+                reasoningEffortHigh
+                  ? "Disable high reasoning effort"
+                  : "Enable high reasoning effort"
+              }
+            >
+              <GaugeIcon className="size-3.5" />
+              <span>Effort</span>
+            </button>
+          )}
           <button
             type="button"
             disabled={toolsDisabled}

@@ -46,6 +46,7 @@ import {
   ChevronRightIcon,
   CopyIcon,
   DownloadIcon,
+  GaugeIcon,
   GlobeIcon,
   HeadphonesIcon,
   LightbulbIcon,
@@ -428,6 +429,49 @@ const ReasoningToggle: FC = () => {
   );
 };
 
+const ReasoningEffortToggle: FC = () => {
+  const modelLoaded = useChatRuntimeStore(
+    (s) => !!s.params.checkpoint && !s.modelLoading,
+  );
+  const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
+  const supportsReasoning = useChatRuntimeStore((s) => s.supportsReasoning);
+  const reasoningEnabled = useChatRuntimeStore((s) => s.reasoningEnabled);
+  const reasoningEffortHigh = useChatRuntimeStore((s) => s.reasoningEffortHigh);
+  const setReasoningEffortHigh = useChatRuntimeStore(
+    (s) => s.setReasoningEffortHigh,
+  );
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled =
+    !useUpstream ||
+    !controlsReady ||
+    (!useUpstream && !supportsReasoning) ||
+    !reasoningEnabled;
+
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => setReasoningEffortHigh(!reasoningEffortHigh)}
+      className={cn(
+        "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+        disabled
+          ? "cursor-not-allowed opacity-40"
+          : reasoningEffortHigh
+            ? "bg-primary/10 text-primary hover:bg-primary/20"
+            : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+      )}
+      aria-label={
+        reasoningEffortHigh
+          ? "Disable high reasoning effort"
+          : "Enable high reasoning effort"
+      }
+    >
+      <GaugeIcon className="size-3.5" />
+      <span>Effort</span>
+    </button>
+  );
+};
+
 const WebSearchToggle: FC = () => {
   const modelLoaded = useChatRuntimeStore(
     (s) => !!s.params.checkpoint && !s.modelLoading,
@@ -550,6 +594,7 @@ const ComposerAction: FC = () => {
         <ComposerAddAttachment />
         <ComposerAudioUpload />
         <ReasoningToggle />
+        <ReasoningEffortToggle />
         <WebSearchToggle />
         <CodeToolsToggle />
       </div>

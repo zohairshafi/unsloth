@@ -12,6 +12,7 @@ import {
 
 const AUTO_TITLE_KEY = "unsloth_chat_auto_title";
 const USE_UPSTREAM_KEY = "unsloth_chat_use_upstream";
+const REASONING_EFFORT_HIGH_KEY = "unsloth_chat_reasoning_effort_high";
 const UPSTREAM_AUTO_STREAM_FALLBACK_KEY = "unsloth_upstream_auto_stream_fallback";
 const AUTO_HEAL_TOOL_CALLS_KEY = "unsloth_auto_heal_tool_calls";
 const MAX_TOOL_CALLS_KEY = "unsloth_max_tool_calls_per_message";
@@ -162,6 +163,7 @@ type ChatRuntimeStore = {
   supportsReasoning: boolean;
   reasoningAlwaysOn: boolean;
   reasoningEnabled: boolean;
+  reasoningEffortHigh: boolean;
   supportsTools: boolean;
   toolsEnabled: boolean;
   codeToolsEnabled: boolean;
@@ -206,6 +208,7 @@ type ChatRuntimeStore = {
   setSettingsPanelOpen: (open: boolean) => void;
   clearCheckpoint: () => void;
   setReasoningEnabled: (enabled: boolean) => void;
+  setReasoningEffortHigh: (enabled: boolean) => void;
   setToolsEnabled: (enabled: boolean) => void;
   setCodeToolsEnabled: (enabled: boolean) => void;
   setToolStatus: (status: string | null) => void;
@@ -243,6 +246,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   supportsReasoning: false,
   reasoningAlwaysOn: false,
   reasoningEnabled: true,
+  reasoningEffortHigh: loadBool(REASONING_EFFORT_HIGH_KEY, false),
   supportsTools: false,
   toolsEnabled: initialUseUpstream,
   codeToolsEnabled: initialUseUpstream,
@@ -370,6 +374,11 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       chatTemplateOverride: null,
     })),
   setReasoningEnabled: (reasoningEnabled) => set({ reasoningEnabled }),
+  setReasoningEffortHigh: (reasoningEffortHigh) =>
+    set(() => {
+      saveBool(REASONING_EFFORT_HIGH_KEY, reasoningEffortHigh);
+      return { reasoningEffortHigh };
+    }),
   setToolsEnabled: (toolsEnabled) => set({ toolsEnabled }),
   setCodeToolsEnabled: (codeToolsEnabled) => set({ codeToolsEnabled }),
   setToolStatus: (toolStatus) => set({ toolStatus }),

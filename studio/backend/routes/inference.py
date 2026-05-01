@@ -2516,6 +2516,23 @@ def _build_openai_upstream_body(
         chat_template_kwargs = existing if isinstance(existing, dict) else {}
         chat_template_kwargs["enable_thinking"] = bool(payload.enable_thinking)
         body["chat_template_kwargs"] = chat_template_kwargs
+
+    # OpenAI SDK's extra_body concept: merge arbitrary provider-specific
+    # fields into the top-level JSON request for upstream providers.
+    extra_body = body.pop("extra_body", None)
+    if isinstance(extra_body, dict):
+        for key, value in extra_body.items():
+            if (
+                key in body
+                and isinstance(body.get(key), dict)
+                and isinstance(value, dict)
+            ):
+                merged = dict(body.get(key) or {})
+                merged.update(value)
+                body[key] = merged
+            else:
+                body[key] = value
+
     return body
 
 

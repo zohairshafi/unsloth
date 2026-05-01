@@ -169,6 +169,8 @@ export interface OpenAIChatCompletionsRequest {
   use_upstream?: boolean | null;
   upstream_auto_stream_fallback?: boolean | null;
   enable_thinking?: boolean | null;
+  reasoning_effort?: "low" | "medium" | "high";
+  extra_body?: Record<string, unknown>;
   enable_tools?: boolean | null;
   enabled_tools?: string[];
   auto_heal_tool_calls?: boolean;

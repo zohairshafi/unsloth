@@ -519,6 +519,27 @@ class TestOpenAIUpstreamHelpers:
             "enable_thinking": True,
         }
 
+    def test_build_openai_upstream_body_merges_extra_body_and_reasoning_effort(self):
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hello"}],
+            stream = False,
+            enable_thinking = True,
+            reasoning_effort = "high",
+            extra_body = {
+                "thinking": {"type": "enabled"},
+                "chat_template_kwargs": {"foo": "bar"},
+            },
+        )
+
+        body = _build_openai_upstream_body(req, "deepseek/deepseek-chat")
+
+        assert "extra_body" not in body
+        assert body.get("reasoning_effort") == "high"
+        assert body.get("thinking") == {"type": "enabled"}
+        assert body.get("chat_template_kwargs", {}).get("foo") == "bar"
+        assert body.get("chat_template_kwargs", {}).get("enable_thinking") is True
+
     def test_upstream_tool_nudge_skips_tools_for_greetings(self):
         nudge = _upstream_tool_use_nudge(
             "meta/llama-3.3-70b-instruct",
