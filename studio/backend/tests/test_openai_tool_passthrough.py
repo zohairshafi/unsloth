@@ -49,6 +49,7 @@ from routes.inference import (
     _upstream_builtin_tools_for_payload,
     _upstream_server_tools_enabled,
     _upstream_tool_use_nudge,
+    _route_wiki_llm_stub,
     _wiki_llm_available,
 )
 
@@ -591,6 +592,120 @@ class TestOpenAIUpstreamHelpers:
         monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
 
         assert _wiki_llm_available() is True
+
+    def test_route_wiki_llm_stub_accepts_content_parts_from_upstream(self, monkeypatch):
+        class _DummyLlama:
+            is_loaded = False
+
+        class _DummyBackend:
+            active_model_name = None
+
+        class _FakeResponse:
+            status_code = 200
+            text = "{\"ok\":true}"
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": '{"summary":"ok","entities":[],"concepts":[]}',
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json, headers):
+                return _FakeResponse()
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(
+            inference_routes,
+            "_llm_upstream_base_url",
+            lambda: "https://example.test/v1",
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "_resolve_llm_upstream_model",
+            lambda _requested: "dummy/model",
+        )
+        monkeypatch.setattr(inference_routes, "_llm_upstream_headers", lambda: {})
+        monkeypatch.setattr(inference_routes.httpx, "Client", _FakeClient)
+
+        out = _route_wiki_llm_stub("Extract structured knowledge from the source.")
+        assert out == '{"summary":"ok","entities":[],"concepts":[]}'
+
+    def test_route_wiki_llm_stub_accepts_legacy_choice_text_from_upstream(
+        self,
+        monkeypatch,
+    ):
+        class _DummyLlama:
+            is_loaded = False
+
+        class _DummyBackend:
+            active_model_name = None
+
+        class _FakeResponse:
+            status_code = 200
+            text = "{\"ok\":true}"
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "text": '{"summary":"legacy","entities":[],"concepts":[]}'
+                        }
+                    ]
+                }
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json, headers):
+                return _FakeResponse()
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(
+            inference_routes,
+            "_llm_upstream_base_url",
+            lambda: "https://example.test/v1",
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "_resolve_llm_upstream_model",
+            lambda _requested: "dummy/model",
+        )
+        monkeypatch.setattr(inference_routes, "_llm_upstream_headers", lambda: {})
+        monkeypatch.setattr(inference_routes.httpx, "Client", _FakeClient)
+
+        out = _route_wiki_llm_stub("Extract structured knowledge from the source.")
+        assert out == '{"summary":"legacy","entities":[],"concepts":[]}'
 
     def test_completions_fallback_toggle_defaults_to_enabled(self, monkeypatch):
         monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)

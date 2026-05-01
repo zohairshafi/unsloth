@@ -474,6 +474,67 @@ def _merge_streamed_text_chunks(chunks: Any) -> str:
     return out
 
 
+def _openai_text_from_content_parts(content: Any) -> str:
+    """Best-effort flattening for OpenAI-compatible content part payloads."""
+    if isinstance(content, str):
+        return content.strip()
+
+    parts: list[str] = []
+
+    def _append_text(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                parts.append(text)
+            return
+        if isinstance(value, dict):
+            nested = value.get("value")
+            if isinstance(nested, str):
+                _append_text(nested)
+            return
+
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                _append_text(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+
+            _append_text(part.get("text"))
+            _append_text(part.get("content"))
+            _append_text(part.get("output_text"))
+
+    elif isinstance(content, dict):
+        _append_text(content.get("text"))
+        _append_text(content.get("content"))
+        _append_text(content.get("output_text"))
+
+    return "\n".join(parts).strip()
+
+
+def _openai_choice_text(choice: Any) -> str:
+    """Extract assistant text from a non-streaming OpenAI choice payload."""
+    if not isinstance(choice, dict):
+        return ""
+
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    for candidate in (
+        message.get("content"),
+        message.get("output_text"),
+        message.get("text"),
+        message.get("reasoning_content"),
+        choice.get("text"),
+        choice.get("content"),
+    ):
+        text = _openai_text_from_content_parts(candidate)
+        if text:
+            return text
+    return ""
+
+
 def _route_wiki_llm_stub(prompt: str) -> str:
     """Best-effort wiki LLM function using whichever model backend is active."""
     wants_structured_json = (
@@ -551,10 +612,19 @@ def _route_wiki_llm_stub(prompt: str) -> str:
             if response.status_code == 200:
                 data = response.json()
                 first_choice = (data.get("choices") or [{}])[0]
-                message = first_choice.get("message") or {}
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
+                content = _openai_choice_text(first_choice)
+                if not content:
+                    # Some providers expose plain text outside choices/message.
+                    content = _openai_text_from_content_parts(data.get("output_text"))
+                if not content:
+                    content = _openai_text_from_content_parts(data.get("text"))
+                if content:
+                    return content
+
+                logger.warning(
+                    "Upstream wiki LLM returned 200 but no textual content (keys=%s)",
+                    sorted([str(k) for k in data.keys()])[:20],
+                )
             else:
                 logger.warning(
                     "Upstream wiki LLM call failed: status=%s body=%s",
