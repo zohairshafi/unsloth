@@ -18,6 +18,8 @@ Covers:
 No running server or GPU required.
 """
 
+import asyncio
+import json
 import os
 import sys
 
@@ -39,6 +41,7 @@ from core.inference.anthropic_compat import (
 from routes.inference import (
     _build_passthrough_payload,
     _build_openai_upstream_body,
+    _openai_upstream_tool_loop_events,
     _friendly_error,
     _llm_upstream_completions_fallback_enabled,
     _llm_upstream_embeddings_fallback_enabled,
@@ -742,6 +745,112 @@ class TestOpenAIUpstreamHelpers:
             True,
         )
         assert _llm_upstream_embeddings_fallback_enabled() is True
+
+    def test_upstream_tool_loop_replays_reasoning_content_in_follow_up(
+        self,
+        monkeypatch,
+    ):
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hi"}],
+            stream = False,
+            enable_tools = True,
+            enable_thinking = True,
+            max_tool_calls_per_message = 2,
+        )
+
+        monkeypatch.setattr(
+            inference_routes,
+            "_upstream_builtin_tools_for_payload",
+            lambda _payload: [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "python",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "_upstream_tool_use_nudge",
+            lambda _model, _tools: "",
+        )
+
+        import core.inference.tools as _tools_mod
+
+        monkeypatch.setattr(
+            _tools_mod,
+            "execute_tool",
+            lambda *_a, **_k: "tool-ok",
+        )
+
+        request_bodies: list[dict] = []
+
+        async def _fake_call(body: dict[str, object]) -> dict:
+            request_bodies.append(json.loads(json.dumps(body)))
+            if len(request_bodies) == 1:
+                return {
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "content": None,
+                                "reasoning_content": "reasoning-trace-1",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "python",
+                                            "arguments": '{"code":"print(1)"}',
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 8},
+                }
+
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": "done"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 18, "completion_tokens": 6},
+            }
+
+        monkeypatch.setattr(
+            inference_routes,
+            "_openai_upstream_chat_non_streaming_json_from_body",
+            _fake_call,
+        )
+
+        async def _collect_events() -> list[dict]:
+            collected = []
+            async for event in _openai_upstream_tool_loop_events(req, "dummy/model"):
+                collected.append(event)
+            return collected
+
+        events = asyncio.run(_collect_events())
+
+        assert len(request_bodies) >= 2
+
+        second_messages = request_bodies[1].get("messages") or []
+        assistant_msgs = [
+            msg for msg in second_messages if isinstance(msg, dict) and msg.get("role") == "assistant"
+        ]
+        assert assistant_msgs, f"No assistant replay message in second request: {second_messages!r}"
+        assert assistant_msgs[-1].get("reasoning_content") == "reasoning-trace-1"
+        assert assistant_msgs[-1].get("tool_calls"), "tool_calls missing in replay assistant message"
+
+        content_events = [e for e in events if e.get("type") == "content"]
+        assert content_events
+        assert content_events[-1].get("text") == "done"
 
 
 # =====================================================================

@@ -2955,12 +2955,13 @@ async def _openai_upstream_tool_loop_events(
 
         finish_reason = _valid_finish_reason(choice.get("finish_reason"))
 
-        content = message.get("content")
-        if content is None:
-            content = ""
-        if not isinstance(content, str):
-            content = str(content)
-        if auto_heal:
+        raw_content = message.get("content")
+        content = _openai_text_from_content_parts(raw_content)
+        if not content:
+            content = _openai_text_from_content_parts(message.get("output_text"))
+        if not content and isinstance(choice.get("text"), str):
+            content = str(choice.get("text") or "").strip()
+        if auto_heal and content:
             content = _TOOL_XML_RE.sub("", content).strip()
 
         raw_tool_calls = message.get("tool_calls")
@@ -2971,12 +2972,19 @@ async def _openai_upstream_tool_loop_events(
         ]
 
         assistant_msg: dict[str, Any] = {"role": "assistant"}
-        if content:
-            assistant_msg["content"] = content
+        if raw_content is not None:
+            assistant_msg["content"] = raw_content
         elif tool_calls:
             assistant_msg["content"] = None
         else:
             assistant_msg["content"] = ""
+        if (
+            "reasoning_content" in message
+            and message.get("reasoning_content") is not None
+        ):
+            # Some providers require replaying prior reasoning traces on
+            # subsequent tool-loop turns when thinking mode is enabled.
+            assistant_msg["reasoning_content"] = message.get("reasoning_content")
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         conversation.append(assistant_msg)
@@ -3101,12 +3109,12 @@ async def _openai_upstream_tool_loop_events(
 
     finish_reason = _valid_finish_reason(choice.get("finish_reason"))
 
-    content = message.get("content")
-    if content is None:
-        content = ""
-    if not isinstance(content, str):
-        content = str(content)
-    if auto_heal:
+    content = _openai_text_from_content_parts(message.get("content"))
+    if not content:
+        content = _openai_text_from_content_parts(message.get("output_text"))
+    if not content and isinstance(choice.get("text"), str):
+        content = str(choice.get("text") or "").strip()
+    if auto_heal and content:
         content = _TOOL_XML_RE.sub("", content).strip()
     if not content:
         content = _upstream_empty_assistant_fallback(last_tool_name, last_tool_result)
