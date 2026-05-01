@@ -2316,6 +2316,122 @@ def _extract_content_parts(
     return system_prompt, chat_messages, first_image_b64
 
 
+def _inject_system_text_into_payload(
+    payload: ChatCompletionRequest,
+    injected_text: str,
+) -> ChatCompletionRequest:
+    """Return a payload copy with injected system text prepended safely."""
+    if not injected_text:
+        return payload
+
+    messages = [m.model_copy(deep = True) for m in payload.messages]
+    if (
+        messages
+        and messages[0].role == "system"
+        and isinstance(messages[0].content, str)
+    ):
+        existing = messages[0].content or ""
+        merged = (
+            existing.rstrip() + "\n\n" + injected_text
+            if existing.strip()
+            else injected_text
+        )
+        messages[0] = messages[0].model_copy(update = {"content": merged})
+    else:
+        messages.insert(0, ChatMessage(role = "system", content = injected_text))
+
+    return payload.model_copy(update = {"messages": messages})
+
+
+def _apply_route_rag_history_hooks_to_payload(
+    payload: ChatCompletionRequest,
+    *,
+    request_label: str,
+) -> ChatCompletionRequest:
+    """Apply route-level wiki ingest + RAG prompt injection for upstream paths."""
+    try:
+        system_prompt, chat_messages, _ = _extract_content_parts(payload.messages)
+        system_prompt_lower = system_prompt.lower().strip() if system_prompt else ""
+        if (
+            "write 1 concise chat title" in system_prompt_lower
+            and "output title only" in system_prompt_lower
+        ):
+            logger.debug(
+                "Skipping %s RAG/wiki-history hooks for auto-title request",
+                request_label,
+            )
+            return payload
+
+        if _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT > 0:
+            _ingest_pending_raw_files(
+                max_files = _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT,
+            )
+
+        if chat_messages:
+            last_user_msg = next(
+                (m for m in reversed(chat_messages) if m.get("role") == "user"),
+                None,
+            )
+            last_user_text = (
+                str(last_user_msg.get("content", "")).strip()
+                if last_user_msg
+                else ""
+            )
+
+            if last_user_text:
+                rag_context, rag_debug = _get_route_rag_context(
+                    last_user_text,
+                    return_debug = True,
+                    debug_source = "last-request",
+                )
+                global _LAST_RAG_DEBUG
+                _LAST_RAG_DEBUG = rag_debug
+                selected_pages = [
+                    str(item.get("page", "unknown"))
+                    for item in rag_debug.get("selected", [])
+                ]
+                ranking_mode = str(
+                    rag_debug.get("ranking_mode", "unknown") or "unknown"
+                )
+                logger.info(
+                    "RAG selection for %s request: rank_mode=%s pages=%d chars=%d selected=%s query=%r",
+                    request_label,
+                    ranking_mode,
+                    len(selected_pages),
+                    len(rag_context),
+                    selected_pages,
+                    last_user_text,
+                )
+
+                if rag_context:
+                    logger.info("Injecting RAG context into %s prompt", request_label)
+                    if _RAG_LOG_INJECTED_CONTEXT:
+                        logger.info(
+                            "Injected RAG context:\n%s",
+                            _loggable_rag_context(rag_context),
+                        )
+                    rag_block = (
+                        "Use the following context to help answer the user's request:\n\n"
+                        f"{rag_context}"
+                    )
+                    payload = _inject_system_text_into_payload(payload, rag_block)
+                else:
+                    logger.info(
+                        "RAG produced empty context for %s request",
+                        request_label,
+                    )
+
+            _save_chat_history_to_route_wiki(chat_messages)
+    except Exception as exc:
+        logger.warning(
+            "Failed to apply %s RAG/wiki history hooks: %s",
+            request_label,
+            exc,
+        )
+
+    return payload
+
+
 def _build_openai_upstream_body(
     payload: ChatCompletionRequest,
     model_name: str,
@@ -2385,7 +2501,7 @@ def _openai_sse_chunks_from_non_streaming_payload(
             )
         ],
     )
-    lines.append(f"data: {role_chunk.model_dump_json(exclude_none = True)}\\n\\n")
+    lines.append(f"data: {role_chunk.model_dump_json(exclude_none = True)}\n\n")
 
     if content:
         content_chunk = ChatCompletionChunk(
@@ -2399,7 +2515,7 @@ def _openai_sse_chunks_from_non_streaming_payload(
                 )
             ],
         )
-        lines.append(f"data: {content_chunk.model_dump_json(exclude_none = True)}\\n\\n")
+        lines.append(f"data: {content_chunk.model_dump_json(exclude_none = True)}\n\n")
 
     final_chunk = ChatCompletionChunk(
         id = completion_id,
@@ -2412,7 +2528,7 @@ def _openai_sse_chunks_from_non_streaming_payload(
             )
         ],
     )
-    lines.append(f"data: {final_chunk.model_dump_json(exclude_none = True)}\\n\\n")
+    lines.append(f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n")
 
     usage = payload.get("usage")
     if isinstance(usage, dict):
@@ -2430,9 +2546,9 @@ def _openai_sse_chunks_from_non_streaming_payload(
             if isinstance(payload.get("timings"), dict)
             else None,
         )
-        lines.append(f"data: {usage_chunk.model_dump_json(exclude_none = True)}\\n\\n")
+        lines.append(f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n")
 
-    lines.append("data: [DONE]\\n\\n")
+    lines.append("data: [DONE]\n\n")
     return lines
 
 
@@ -2959,7 +3075,7 @@ async def _openai_upstream_chat_tools_stream(
                     )
                 ],
             )
-            yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\\n\\n"
+            yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\n\n"
 
             async for event in _openai_upstream_tool_loop_events(
                 payload,
@@ -2976,11 +3092,11 @@ async def _openai_upstream_chat_tools_stream(
                                 "content": str(event.get("text") or ""),
                             }
                         )
-                        + "\\n\\n"
+                        + "\n\n"
                     )
                     continue
                 if event_type in {"tool_start", "tool_end"}:
-                    yield f"data: {json.dumps(event)}\\n\\n"
+                    yield f"data: {json.dumps(event)}\n\n"
                     continue
                 if event_type == "content":
                     chunk = ChatCompletionChunk(
@@ -2994,7 +3110,7 @@ async def _openai_upstream_chat_tools_stream(
                             )
                         ],
                     )
-                    yield f"data: {chunk.model_dump_json(exclude_none = True)}\\n\\n"
+                    yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
                     continue
                 if event_type == "final":
                     final_chunk = ChatCompletionChunk(
@@ -3008,7 +3124,7 @@ async def _openai_upstream_chat_tools_stream(
                             )
                         ],
                     )
-                    yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\\n\\n"
+                    yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
 
                     usage = event.get("usage")
                     timings = event.get("timings")
@@ -3021,9 +3137,9 @@ async def _openai_upstream_chat_tools_stream(
                             usage = usage if isinstance(usage, CompletionUsage) else None,
                             timings = timings if isinstance(timings, dict) else None,
                         )
-                        yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\\n\\n"
+                        yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n"
 
-                    yield "data: [DONE]\\n\\n"
+                    yield "data: [DONE]\n\n"
                     return
 
             # Safety fallback if loop exits without explicit final event.
@@ -3038,8 +3154,8 @@ async def _openai_upstream_chat_tools_stream(
                     )
                 ],
             )
-            yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\\n\\n"
-            yield "data: [DONE]\\n\\n"
+            yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+            yield "data: [DONE]\n\n"
         except HTTPException as exc:
             err = {
                 "error": {
@@ -3047,7 +3163,7 @@ async def _openai_upstream_chat_tools_stream(
                     "type": "server_error",
                 }
             }
-            yield f"data: {json.dumps(err)}\\n\\n"
+            yield f"data: {json.dumps(err)}\n\n"
         except Exception as exc:
             logger.error("openai upstream server-tools stream error: %s", exc)
             err = {
@@ -3056,7 +3172,7 @@ async def _openai_upstream_chat_tools_stream(
                     "type": "server_error",
                 }
             }
-            yield f"data: {json.dumps(err)}\\n\\n"
+            yield f"data: {json.dumps(err)}\n\n"
 
     return StreamingResponse(
         _stream(),
@@ -3221,14 +3337,37 @@ async def _openai_upstream_chat_stream(
             detail = f"Upstream model server error: {err_text[:500]}",
         )
 
+    content_type = str(resp.headers.get("content-type", "")).lower()
+    if "text/event-stream" not in content_type:
+        logger.warning(
+            "Upstream stream requested but server returned non-SSE content-type=%s; "
+            "falling back to non-streaming payload conversion.",
+            content_type or "<missing>",
+        )
+        try:
+            raw_payload = await resp.aread()
+            parsed = _parse_openai_non_streaming_payload(raw_payload)
+            return _openai_streaming_response_from_payload(parsed, model_name)
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
     async def _stream():
         lines_iter = None
         saw_data_line = False
         saw_done = False
+        client_disconnected = False
         try:
             lines_iter = resp.aiter_lines()
             async for raw_line in lines_iter:
                 if await request.is_disconnected():
+                    client_disconnected = True
                     break
                 if not raw_line:
                     continue
@@ -3239,6 +3378,44 @@ async def _openai_upstream_chat_stream(
                 if raw_line[6:].strip() == "[DONE]":
                     saw_done = True
                     break
+            if client_disconnected:
+                return
+            if not saw_data_line:
+                logger.warning(
+                    "Upstream stream completed with no SSE data lines for model=%s; "
+                    "falling back to non-streaming for this request.",
+                    model_name,
+                )
+                if payload.enable_thinking and fallback_enabled:
+                    _remember_upstream_stream_thinking_compat(model_name, False)
+                try:
+                    raw_payload = await _openai_upstream_chat_non_streaming_raw(
+                        payload,
+                        model_name,
+                    )
+                    parsed = _parse_openai_non_streaming_payload(raw_payload)
+                    for line in _openai_sse_chunks_from_non_streaming_payload(
+                        parsed,
+                        model_name,
+                    ):
+                        yield line
+                    return
+                except Exception as fallback_exc:
+                    logger.error(
+                        "Upstream no-data stream fallback failed: %s",
+                        fallback_exc,
+                    )
+                    err = {
+                        "error": {
+                            "message": (
+                                "Upstream stream returned no tokens and fallback failed: "
+                                f"{fallback_exc}"
+                            ),
+                            "type": "server_error",
+                        },
+                    }
+                    yield f"data: {json.dumps(err)}\n\n"
+                    return
             if payload.enable_thinking and fallback_enabled and saw_done:
                 _remember_upstream_stream_thinking_compat(model_name, True)
         except Exception as exc:
@@ -3437,26 +3614,31 @@ async def openai_chat_completions(
                 ),
             )
 
-        upstream_model = _resolve_llm_upstream_model(payload.model)
-        if _upstream_server_tools_enabled(payload):
-            if payload.stream:
+        upstream_payload = _apply_route_rag_history_hooks_to_payload(
+            payload,
+            request_label = "upstream",
+        )
+
+        upstream_model = _resolve_llm_upstream_model(upstream_payload.model)
+        if _upstream_server_tools_enabled(upstream_payload):
+            if upstream_payload.stream:
                 return await _openai_upstream_chat_tools_stream(
                     request,
-                    payload,
+                    upstream_payload,
                     upstream_model,
                 )
             return await _openai_upstream_chat_tools_non_streaming(
-                payload,
+                upstream_payload,
                 upstream_model,
             )
-        if payload.stream:
+        if upstream_payload.stream:
             return await _openai_upstream_chat_stream(
                 request,
-                payload,
+                upstream_payload,
                 upstream_model,
             )
         return await _openai_upstream_chat_non_streaming(
-            payload,
+            upstream_payload,
             upstream_model,
         )
 
@@ -3469,26 +3651,31 @@ async def openai_chat_completions(
         backend = get_inference_backend()
         if not backend.active_model_name:
             if _llm_upstream_enabled():
-                upstream_model = _resolve_llm_upstream_model(payload.model)
-                if _upstream_server_tools_enabled(payload):
-                    if payload.stream:
+                upstream_payload = _apply_route_rag_history_hooks_to_payload(
+                    payload,
+                    request_label = "upstream-fallback",
+                )
+
+                upstream_model = _resolve_llm_upstream_model(upstream_payload.model)
+                if _upstream_server_tools_enabled(upstream_payload):
+                    if upstream_payload.stream:
                         return await _openai_upstream_chat_tools_stream(
                             request,
-                            payload,
+                            upstream_payload,
                             upstream_model,
                         )
                     return await _openai_upstream_chat_tools_non_streaming(
-                        payload,
+                        upstream_payload,
                         upstream_model,
                     )
-                if payload.stream:
+                if upstream_payload.stream:
                     return await _openai_upstream_chat_stream(
                         request,
-                        payload,
+                        upstream_payload,
                         upstream_model,
                     )
                 return await _openai_upstream_chat_non_streaming(
-                    payload,
+                    upstream_payload,
                     upstream_model,
                 )
             raise HTTPException(
