@@ -8,6 +8,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { applyQwenThinkingParams } from "@/features/chat/utils/qwen-params";
@@ -17,7 +18,10 @@ import { cn } from "@/lib/utils";
 import { ArrowUpIcon, GaugeIcon, GlobeIcon, HeadphonesIcon, LightbulbIcon, LightbulbOffIcon, MicIcon, PlusIcon, SquareIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import { loadModel, validateModel } from "./api/chat-api";
-import { useChatRuntimeStore } from "./stores/chat-runtime-store";
+import {
+  resolveReasoningStyle,
+  useChatRuntimeStore,
+} from "./stores/chat-runtime-store";
 import {
   type KeyboardEvent,
   type MutableRefObject,
@@ -254,6 +258,7 @@ export function SharedComposer({
   const reasoningEnabled = useChatRuntimeStore((s) => s.reasoningEnabled);
   const setReasoningEnabled = useChatRuntimeStore((s) => s.setReasoningEnabled);
   const reasoningStyle = useChatRuntimeStore((s) => s.reasoningStyle);
+  const setReasoningStyle = useChatRuntimeStore((s) => s.setReasoningStyle);
   const reasoningEffort = useChatRuntimeStore((s) => s.reasoningEffort);
   const setReasoningEffort = useChatRuntimeStore((s) => s.setReasoningEffort);
   const supportsPreserveThinking = useChatRuntimeStore((s) => s.supportsPreserveThinking);
@@ -266,8 +271,6 @@ export function SharedComposer({
   const setCodeToolsEnabled = useChatRuntimeStore((s) => s.setCodeToolsEnabled);
   const controlsReady = modelLoaded || useUpstream;
   const reasoningDisabled = !controlsReady || (!useUpstream && !supportsReasoning);
-  const reasoningEffortDisabled =
-    !useUpstream || reasoningDisabled || !(reasoningEnabled || reasoningAlwaysOn);
   const toolsDisabled = !controlsReady || (!useUpstream && !supportsTools);
   const setPendingAudioStore = useChatRuntimeStore((s) => s.setPendingAudio);
   const clearPendingAudioStore = useChatRuntimeStore((s) => s.clearPendingAudio);
@@ -409,10 +412,19 @@ export function SharedComposer({
         store.setModelRequiresTrustRemoteCode(
           resp.requires_trust_remote_code ?? false,
         );
+        const supportsReasoning = resp.supports_reasoning ?? false;
+        const reasoningAlwaysOn = resp.reasoning_always_on ?? false;
+        const currentReasoningStyle = useChatRuntimeStore.getState().reasoningStyle;
+        const reasoningStyle = resolveReasoningStyle(
+          supportsReasoning,
+          reasoningAlwaysOn,
+          resp.reasoning_style,
+          currentReasoningStyle,
+        );
         useChatRuntimeStore.setState({
-          supportsReasoning: resp.supports_reasoning ?? false,
-          reasoningAlwaysOn: resp.reasoning_always_on ?? false,
-          reasoningStyle: resp.reasoning_style ?? "enable_thinking",
+          supportsReasoning,
+          reasoningAlwaysOn,
+          reasoningStyle,
           supportsPreserveThinking: resp.supports_preserve_thinking ?? false,
           supportsTools: resp.supports_tools ?? false,
         });
@@ -542,8 +554,8 @@ export function SharedComposer({
         className="mb-1 min-h-12 w-full resize-none overflow-y-hidden bg-transparent pl-5 pr-4 pt-2 pb-3 text-sm font-[450] outline-none placeholder:text-muted-foreground focus-visible:ring-0"
         rows={1}
       />
-      <div className="relative mx-2 mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-1">
+      <div className="relative mx-2 mb-2 flex min-w-0 items-center justify-between">
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto pr-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden [&>*]:shrink-0 [&>*]:whitespace-nowrap">
           <input
             ref={fileInputRef}
             type="file"
@@ -591,68 +603,127 @@ export function SharedComposer({
               </TooltipIconButton>
             </>
           )}
-          {reasoningStyle === "reasoning_effort" ? (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild={true}>
-                <button
-                  type="button"
-                  disabled={reasoningDisabled}
-                  className={cn(
-                    "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                    reasoningDisabled
-                      ? "cursor-not-allowed opacity-40"
-                      : "bg-primary/10 text-primary hover:bg-primary/20",
-                  )}
-                  aria-label={`Reasoning effort: ${reasoningEffort}`}
-                >
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild={true}>
+              <button
+                type="button"
+                disabled={reasoningDisabled}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+                  reasoningDisabled
+                    ? "cursor-not-allowed opacity-40"
+                    : (reasoningAlwaysOn || reasoningStyle === "reasoning_effort" || reasoningEnabled)
+                      ? "bg-primary/10 text-primary hover:bg-primary/20"
+                      : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+                )}
+                aria-label={
+                  reasoningStyle === "reasoning_effort"
+                    ? `Reasoning effort: ${reasoningEffort}`
+                    : reasoningEnabled
+                      ? "Disable thinking"
+                      : "Enable thinking"
+                }
+              >
+                {(reasoningAlwaysOn || reasoningStyle === "reasoning_effort" || reasoningEnabled) && !reasoningDisabled ? (
                   <LightbulbIcon className="size-3.5" />
-                  <span>
-                    Think:{" "}
-                    {reasoningEffort.charAt(0).toUpperCase() +
-                      reasoningEffort.slice(1)}
-                  </span>
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {(["low", "medium", "high"] as const).map((level) => (
-                  <DropdownMenuItem
-                    key={level}
-                    onSelect={() => setReasoningEffort(level)}
-                  >
-                    {level.charAt(0).toUpperCase() + level.slice(1)}
-                    {reasoningEffort === level ? " \u2713" : ""}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          ) : (
-            <button
-              type="button"
-              disabled={reasoningDisabled}
-              onClick={() => {
-                if (reasoningAlwaysOn) return;
-                const next = !reasoningEnabled;
-                setReasoningEnabled(next);
-                applyQwenThinkingParams(next);
-              }}
-              className={cn(
-                "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-                reasoningDisabled
-                  ? "cursor-not-allowed opacity-40"
-                  : (reasoningEnabled || reasoningAlwaysOn)
-                    ? "bg-primary/10 text-primary hover:bg-primary/20"
-                    : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
-              )}
-              aria-label={reasoningEnabled ? "Disable thinking" : "Enable thinking"}
-            >
-              {(reasoningEnabled || reasoningAlwaysOn) && !reasoningDisabled ? (
-                <LightbulbIcon className="size-3.5" />
-              ) : (
-                <LightbulbOffIcon className="size-3.5" />
-              )}
-              <span>Think</span>
-            </button>
-          )}
+                ) : (
+                  <LightbulbOffIcon className="size-3.5" />
+                )}
+                <span>
+                  {reasoningStyle === "reasoning_effort"
+                    ? `Think: ${reasoningEffort.charAt(0).toUpperCase() + reasoningEffort.slice(1)}`
+                    : "Think"}
+                </span>
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                disabled={reasoningDisabled}
+                onSelect={() => setReasoningStyle("enable_thinking")}
+              >
+                Mode: Toggle thinking
+                {reasoningStyle === "enable_thinking" ? " \u2713" : ""}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={reasoningDisabled}
+                onSelect={() => {
+                  setReasoningStyle("reasoning_effort");
+                  setReasoningEnabled(true);
+                }}
+              >
+                Mode: Effort based
+                {reasoningStyle === "reasoning_effort" ? " \u2713" : ""}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={reasoningDisabled || reasoningStyle !== "enable_thinking" || reasoningAlwaysOn}
+                onSelect={() => {
+                  const next = !reasoningEnabled;
+                  setReasoningEnabled(next);
+                  applyQwenThinkingParams(next);
+                }}
+              >
+                {reasoningEnabled ? "Disable thinking" : "Enable thinking"}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              {(["low", "medium", "high"] as const).map((level) => (
+                <DropdownMenuItem
+                  key={level}
+                  disabled={reasoningDisabled}
+                  onSelect={() => {
+                    setReasoningStyle("reasoning_effort");
+                    setReasoningEffort(level);
+                    setReasoningEnabled(true);
+                  }}
+                >
+                  Effort: {level.charAt(0).toUpperCase() + level.slice(1)}
+                  {reasoningStyle === "reasoning_effort" && reasoningEffort === level
+                    ? " \u2713"
+                    : ""}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild={true}>
+              <button
+                type="button"
+                disabled={reasoningDisabled}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+                  reasoningDisabled
+                    ? "cursor-not-allowed opacity-40"
+                    : reasoningStyle === "reasoning_effort"
+                      ? "bg-primary/10 text-primary hover:bg-primary/20"
+                      : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+                )}
+                aria-label={`Reasoning effort: ${reasoningEffort}`}
+              >
+                <GaugeIcon className="size-3.5" />
+                <span>
+                  Effort: {reasoningEffort.charAt(0).toUpperCase() + reasoningEffort.slice(1)}
+                </span>
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {(["low", "medium", "high"] as const).map((level) => (
+                <DropdownMenuItem
+                  key={level}
+                  disabled={reasoningDisabled}
+                  onSelect={() => {
+                    setReasoningStyle("reasoning_effort");
+                    setReasoningEffort(level);
+                    setReasoningEnabled(true);
+                  }}
+                >
+                  Effort: {level.charAt(0).toUpperCase() + level.slice(1)}
+                  {reasoningStyle === "reasoning_effort" && reasoningEffort === level
+                    ? " \u2713"
+                    : ""}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
           {supportsPreserveThinking && (
             <button
               type="button"
@@ -713,7 +784,7 @@ export function SharedComposer({
             <span>Code</span>
           </button>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="shrink-0 flex items-center gap-1">
           {dictationSupported && (
             <>
               {!isDictating ? (

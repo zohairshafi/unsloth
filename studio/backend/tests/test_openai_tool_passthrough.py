@@ -676,6 +676,287 @@ class TestOpenAIUpstreamHelpers:
         out = _route_wiki_llm_stub("Extract structured knowledge from the source.")
         assert out == '{"summary":"ok","entities":[],"concepts":[]}'
 
+    def test_route_wiki_llm_stub_prefers_upstream_for_structured_json_prompts(
+        self,
+        monkeypatch,
+    ):
+        class _DummyLlama:
+            is_loaded = True
+
+            def generate_chat_completion(self, **kwargs):
+                raise AssertionError("Local GGUF backend should not run for strict JSON extraction")
+
+        class _DummyBackend:
+            active_model_name = "local-model"
+
+            def generate_chat_response(self, **kwargs):
+                raise AssertionError(
+                    "Transformer backend should not run for strict JSON extraction"
+                )
+
+        observed_body: dict[str, object] = {}
+
+        class _FakeResponse:
+            status_code = 200
+            text = "{\"ok\":true}"
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"summary":"upstream","entities":[],"concepts":[]}'
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json, headers):
+                observed_body.update(json)
+                return _FakeResponse()
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_THINKING_ENABLED", True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_STYLE", "reasoning_effort")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_EFFORT", "high")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PRESERVE_THINKING", False)
+        monkeypatch.setattr(
+            inference_routes,
+            "_llm_upstream_base_url",
+            lambda: "https://example.test/v1",
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "_resolve_llm_upstream_model",
+            lambda _requested: "dummy/model",
+        )
+        monkeypatch.setattr(inference_routes, "_llm_upstream_headers", lambda: {})
+        monkeypatch.setattr(inference_routes.httpx, "Client", _FakeClient)
+
+        out = _route_wiki_llm_stub(
+            "Return strict JSON with keys: summary, entities, concepts."
+        )
+        assert out == '{"summary":"upstream","entities":[],"concepts":[]}'
+        assert observed_body.get("response_format") == {"type": "json_object"}
+        assert "enable_thinking" not in observed_body
+        assert observed_body.get("reasoning_effort") == "high"
+        assert "chat_template_kwargs" not in observed_body
+        assert int(observed_body.get("max_tokens") or 0) >= 2000
+
+    def test_route_wiki_llm_stub_prefers_upstream_for_non_structured_prompts(
+        self,
+        monkeypatch,
+    ):
+        class _DummyLlama:
+            is_loaded = True
+
+            def generate_chat_completion(self, **kwargs):
+                raise AssertionError("Local GGUF backend should not run when upstream preference is enabled")
+
+        class _DummyBackend:
+            active_model_name = "local-model"
+
+            def generate_chat_response(self, **kwargs):
+                raise AssertionError(
+                    "Transformer backend should not run when upstream preference is enabled"
+                )
+
+        observed_body: dict[str, object] = {}
+
+        class _FakeResponse:
+            status_code = 200
+            text = "{\"ok\":true}"
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "upstream non-structured output"
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json, headers):
+                observed_body.update(json)
+                return _FakeResponse()
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PREFER_UPSTREAM", True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_THINKING_ENABLED", True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_STYLE", "reasoning_effort")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_EFFORT", "high")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PRESERVE_THINKING", False)
+        monkeypatch.setattr(
+            inference_routes,
+            "_llm_upstream_base_url",
+            lambda: "https://example.test/v1",
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "_resolve_llm_upstream_model",
+            lambda _requested: "dummy/model",
+        )
+        monkeypatch.setattr(inference_routes, "_llm_upstream_headers", lambda: {})
+        monkeypatch.setattr(inference_routes.httpx, "Client", _FakeClient)
+
+        out = _route_wiki_llm_stub("Summarize this source and list key concepts.")
+        assert out == "upstream non-structured output"
+        assert observed_body.get("reasoning_effort") == "high"
+
+    def test_route_wiki_llm_stub_can_disable_upstream_preference(
+        self,
+        monkeypatch,
+    ):
+        class _DummyLlama:
+            is_loaded = True
+
+            def generate_chat_completion(self, **kwargs):
+                return ["local output"]
+
+        class _DummyBackend:
+            active_model_name = None
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PREFER_UPSTREAM", False)
+
+        out = _route_wiki_llm_stub("Summarize this source and list key concepts.")
+        assert out == "local output"
+
+    def test_route_wiki_llm_stub_applies_enable_thinking_style_for_local_gguf(
+        self,
+        monkeypatch,
+    ):
+        observed_kwargs: dict[str, object] = {}
+
+        class _DummyLlama:
+            is_loaded = True
+
+            def generate_chat_completion(self, **kwargs):
+                observed_kwargs.update(kwargs)
+                return ["local thinking output"]
+
+        class _DummyBackend:
+            active_model_name = None
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PREFER_UPSTREAM", False)
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: False)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_THINKING_ENABLED", True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_STYLE", "enable_thinking")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_EFFORT", "high")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PRESERVE_THINKING", True)
+
+        out = _route_wiki_llm_stub("Summarize this source and list key concepts.")
+        assert out == "local thinking output"
+        assert observed_kwargs.get("enable_thinking") is True
+        assert observed_kwargs.get("preserve_thinking") is True
+        assert "reasoning_effort" not in observed_kwargs
+
+    def test_route_wiki_llm_stub_retries_upstream_without_reasoning_fields(
+        self,
+        monkeypatch,
+    ):
+        call_bodies: list[dict[str, object]] = []
+
+        class _DummyLlama:
+            is_loaded = False
+
+        class _DummyBackend:
+            active_model_name = None
+
+        class _FakeResponse:
+            def __init__(self, status_code: int, body: dict[str, object]):
+                self.status_code = status_code
+                self.text = "{\"ok\":true}" if status_code == 200 else "{\"error\":\"bad_request\"}"
+                self._body = body
+
+            def json(self):
+                return self._body
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json, headers):
+                body_copy = dict(json)
+                call_bodies.append(body_copy)
+                if "reasoning_effort" in body_copy:
+                    return _FakeResponse(400, {"error": "unsupported_field"})
+                return _FakeResponse(
+                    200,
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "upstream compatibility output"
+                                }
+                            }
+                        ]
+                    },
+                )
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PREFER_UPSTREAM", True)
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_THINKING_ENABLED", True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_STYLE", "reasoning_effort")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_EFFORT", "high")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PRESERVE_THINKING", False)
+        monkeypatch.setattr(
+            inference_routes,
+            "_llm_upstream_base_url",
+            lambda: "https://example.test/v1",
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "_resolve_llm_upstream_model",
+            lambda _requested: "dummy/model",
+        )
+        monkeypatch.setattr(inference_routes, "_llm_upstream_headers", lambda: {})
+        monkeypatch.setattr(inference_routes.httpx, "Client", _FakeClient)
+
+        out = _route_wiki_llm_stub("Summarize this source and list key concepts.")
+        assert out == "upstream compatibility output"
+        assert len(call_bodies) >= 2
+        assert "reasoning_effort" in call_bodies[0]
+        assert all("reasoning_effort" not in body for body in call_bodies[1:])
+
     def test_route_wiki_llm_stub_accepts_legacy_choice_text_from_upstream(
         self,
         monkeypatch,

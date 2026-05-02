@@ -292,6 +292,30 @@ try:
 except ValueError:
     _RAG_LOG_INJECTED_CONTEXT_MAX_CHARS = 12000
 _WIKI_LLM_MAX_TOKENS = int(os.getenv("UNSLOTH_WIKI_LLM_MAX_TOKENS", "1200"))
+_WIKI_LLM_PREFER_UPSTREAM = os.getenv(
+    "UNSLOTH_WIKI_LLM_PREFER_UPSTREAM",
+    "true",
+).strip().lower() not in {"0", "false", "no", "off"}
+_WIKI_LLM_THINKING_ENABLED = os.getenv(
+    "UNSLOTH_WIKI_LLM_THINKING_ENABLED",
+    "true",
+).strip().lower() not in {"0", "false", "no", "off"}
+_WIKI_LLM_REASONING_STYLE = os.getenv(
+    "UNSLOTH_WIKI_LLM_REASONING_STYLE",
+    "reasoning_effort",
+).strip().lower()
+if _WIKI_LLM_REASONING_STYLE not in {"enable_thinking", "reasoning_effort"}:
+    _WIKI_LLM_REASONING_STYLE = "reasoning_effort"
+_WIKI_LLM_REASONING_EFFORT = os.getenv(
+    "UNSLOTH_WIKI_LLM_REASONING_EFFORT",
+    "high",
+).strip().lower()
+if _WIKI_LLM_REASONING_EFFORT not in {"low", "medium", "high"}:
+    _WIKI_LLM_REASONING_EFFORT = "high"
+_WIKI_LLM_PRESERVE_THINKING = os.getenv(
+    "UNSLOTH_WIKI_LLM_PRESERVE_THINKING",
+    "false",
+).strip().lower() not in {"0", "false", "no", "off"}
 _WIKI_AUTO_LINT_EVERY_QUERY = int(os.getenv("UNSLOTH_WIKI_AUTO_LINT_EVERY", "10"))
 try:
     _WIKI_AUTO_RETRY_FALLBACK_MAX_PAGES = max(
@@ -366,6 +390,11 @@ _UNSLOTH_ONLY_OPENAI_FIELDS = {
     "session_id",
     "upstream_auto_stream_fallback",
 }
+_WIKI_REASONING_FIELDS = (
+    "enable_thinking",
+    "reasoning_effort",
+    "preserve_thinking",
+)
 
 
 def _normalize_openai_base_url(base_url: str) -> str:
@@ -483,19 +512,46 @@ def _wiki_llm_available() -> bool:
     return _llm_upstream_enabled()
 
 
-def _supports_enable_wiki_rag_history_arg(generate_fn: Any) -> bool:
+def _supports_generate_kwarg(generate_fn: Any, arg_name: str) -> bool:
     try:
         signature = inspect.signature(generate_fn)
     except (TypeError, ValueError):
         return False
 
-    if "enable_wiki_rag_history" in signature.parameters:
+    if arg_name in signature.parameters:
         return True
 
     return any(
         param.kind == inspect.Parameter.VAR_KEYWORD
         for param in signature.parameters.values()
     )
+
+
+def _supports_enable_wiki_rag_history_arg(generate_fn: Any) -> bool:
+    return _supports_generate_kwarg(generate_fn, "enable_wiki_rag_history")
+
+
+def _wiki_llm_reasoning_kwargs() -> dict[str, Any]:
+    if not _WIKI_LLM_THINKING_ENABLED:
+        return {}
+
+    kwargs: dict[str, Any] = {}
+    if _WIKI_LLM_REASONING_STYLE == "reasoning_effort":
+        kwargs["reasoning_effort"] = _WIKI_LLM_REASONING_EFFORT
+    else:
+        kwargs["enable_thinking"] = True
+
+    if _WIKI_LLM_PRESERVE_THINKING:
+        kwargs["preserve_thinking"] = True
+
+    return kwargs
+
+
+def _strip_wiki_reasoning_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(payload)
+    for field in _WIKI_REASONING_FIELDS:
+        sanitized.pop(field, None)
+    return sanitized
 
 
 def _merge_streamed_text_chunks(chunks: Any) -> str:
@@ -582,11 +638,175 @@ def _route_wiki_llm_stub(prompt: str) -> str:
     wants_structured_json = (
         "Return strict JSON with keys:" in prompt or "JSON repair assistant" in prompt
     )
+    max_tokens = _WIKI_LLM_MAX_TOKENS
+    if wants_structured_json:
+        # Structured extraction JSON can be longer than normal chat replies.
+        max_tokens = max(_WIKI_LLM_MAX_TOKENS, 2000)
 
     temp = 0.0 if wants_structured_json else 0.2
     top_p = 1.0 if wants_structured_json else 0.9
     top_k = 1 if wants_structured_json else 20
     min_p = 0.0
+    wiki_reasoning_kwargs = _wiki_llm_reasoning_kwargs()
+
+    def _normalize_structured_json_text(text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return raw
+        except Exception:
+            pass
+
+        fenced = _re.search(
+            r"```(?:json)?\s*(\{[\s\S]*?\})\s*```",
+            raw,
+            flags = _re.IGNORECASE,
+        )
+        if fenced:
+            candidate = fenced.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return candidate
+            except Exception:
+                pass
+
+        candidate_match = _re.search(r"\{[\s\S]*\}", raw, flags = _re.S)
+        if candidate_match:
+            candidate = candidate_match.group(0).strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return candidate
+            except Exception:
+                pass
+
+        return raw
+
+    def _upstream_wiki_call(*, strict_json: bool) -> str:
+        if not _llm_upstream_enabled():
+            return ""
+
+        target_url = f"{_llm_upstream_base_url()}/chat/completions"
+        upstream_model = _resolve_llm_upstream_model(None)
+
+        base_body: dict[str, Any] = {
+            "model": upstream_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temp,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if wiki_reasoning_kwargs:
+            base_body.update(wiki_reasoning_kwargs)
+
+        attempts: list[dict[str, Any]] = []
+        if strict_json:
+            strict_body = dict(base_body)
+            strict_body["messages"] = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return only a valid JSON object matching the requested schema. "
+                        "Do not include markdown fences, reasoning text, or any other prose."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+            strict_body["response_format"] = {"type": "json_object"}
+
+            relaxed_body = dict(strict_body)
+            relaxed_body.pop("response_format", None)
+            attempts.extend([strict_body, relaxed_body])
+            if wiki_reasoning_kwargs:
+                attempts.extend(
+                    [
+                        _strip_wiki_reasoning_fields(strict_body),
+                        _strip_wiki_reasoning_fields(relaxed_body),
+                    ]
+                )
+        else:
+            attempts.append(base_body)
+            if wiki_reasoning_kwargs:
+                attempts.append(_strip_wiki_reasoning_fields(base_body))
+
+        for idx, body in enumerate(attempts, start = 1):
+            try:
+                with httpx.Client(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
+                    response = client.post(
+                        target_url,
+                        json = body,
+                        headers = _llm_upstream_headers(),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Upstream wiki LLM call failed (attempt=%d strict_json=%s): %s",
+                    idx,
+                    strict_json,
+                    exc,
+                )
+                continue
+
+            if response.status_code != 200:
+                logger.warning(
+                    "Upstream wiki LLM call failed (attempt=%d strict_json=%s): status=%s body=%s",
+                    idx,
+                    strict_json,
+                    response.status_code,
+                    response.text[:240],
+                )
+                continue
+
+            try:
+                data = response.json()
+            except Exception as exc:
+                logger.warning(
+                    "Upstream wiki LLM returned invalid JSON envelope (attempt=%d strict_json=%s): %s",
+                    idx,
+                    strict_json,
+                    exc,
+                )
+                continue
+
+            first_choice = (data.get("choices") or [{}])[0]
+            content = _openai_choice_text(first_choice)
+            if not content:
+                content = _openai_text_from_content_parts(data.get("output_text"))
+            if not content:
+                content = _openai_text_from_content_parts(data.get("text"))
+
+            if not content:
+                logger.warning(
+                    "Upstream wiki LLM returned 200 but no textual content (attempt=%d strict_json=%s keys=%s)",
+                    idx,
+                    strict_json,
+                    sorted([str(k) for k in data.keys()])[:20],
+                )
+                continue
+
+            content = content.strip()
+            if strict_json:
+                content = _normalize_structured_json_text(content)
+            if content:
+                return content
+
+        return ""
+
+    # Prefer upstream first for wiki maintenance/extraction flows when enabled,
+    # then fall back to local backends for resilience.
+    if _WIKI_LLM_PREFER_UPSTREAM:
+        upstream_first = _upstream_wiki_call(strict_json = wants_structured_json)
+        if upstream_first:
+            return upstream_first
+    elif wants_structured_json:
+        strict_content = _upstream_wiki_call(strict_json = True)
+        if strict_content:
+            return strict_content
 
     try:
         llama_backend = get_llama_cpp_backend()
@@ -597,10 +817,10 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                 top_p = top_p,
                 top_k = top_k,
                 min_p = min_p,
-                max_tokens = _WIKI_LLM_MAX_TOKENS,
+                max_tokens = max_tokens,
                 repetition_penalty = 1.0,
                 presence_penalty = 0.0,
-                enable_thinking = False,
+                **wiki_reasoning_kwargs,
             )
             final = _merge_streamed_text_chunks(chunks)
             if final.strip():
@@ -618,12 +838,15 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                 "top_p": top_p,
                 "top_k": (top_k if wants_structured_json else 40),
                 "min_p": min_p,
-                "max_new_tokens": _WIKI_LLM_MAX_TOKENS,
+                "max_new_tokens": max_tokens,
                 "repetition_penalty": 1.0,
                 "cancel_event": None,
             }
             if _supports_enable_wiki_rag_history_arg(backend.generate_chat_response):
                 generate_kwargs["enable_wiki_rag_history"] = True
+            for field, value in wiki_reasoning_kwargs.items():
+                if _supports_generate_kwarg(backend.generate_chat_response, field):
+                    generate_kwargs[field] = value
 
             out = _merge_streamed_text_chunks(
                 backend.generate_chat_response(**generate_kwargs)
@@ -633,48 +856,10 @@ def _route_wiki_llm_stub(prompt: str) -> str:
     except Exception as exc:
         logger.warning(f"Transformer wiki LLM call failed, falling back: {exc}")
 
-    if _llm_upstream_enabled():
-        try:
-            target_url = f"{_llm_upstream_base_url()}/chat/completions"
-            upstream_model = _resolve_llm_upstream_model(None)
-            body = {
-                "model": upstream_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": temp,
-                "top_p": top_p,
-                "max_tokens": _WIKI_LLM_MAX_TOKENS,
-                "stream": False,
-            }
-            with httpx.Client(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
-                response = client.post(
-                    target_url,
-                    json = body,
-                    headers = _llm_upstream_headers(),
-                )
-            if response.status_code == 200:
-                data = response.json()
-                first_choice = (data.get("choices") or [{}])[0]
-                content = _openai_choice_text(first_choice)
-                if not content:
-                    # Some providers expose plain text outside choices/message.
-                    content = _openai_text_from_content_parts(data.get("output_text"))
-                if not content:
-                    content = _openai_text_from_content_parts(data.get("text"))
-                if content:
-                    return content
-
-                logger.warning(
-                    "Upstream wiki LLM returned 200 but no textual content (keys=%s)",
-                    sorted([str(k) for k in data.keys()])[:20],
-                )
-            else:
-                logger.warning(
-                    "Upstream wiki LLM call failed: status=%s body=%s",
-                    response.status_code,
-                    response.text[:240],
-                )
-        except Exception as exc:
-            logger.warning("Upstream wiki LLM call failed, falling back: %s", exc)
+    if not _WIKI_LLM_PREFER_UPSTREAM:
+        upstream_content = _upstream_wiki_call(strict_json = False)
+        if upstream_content:
+            return upstream_content
 
     # Final fallback keeps ingestion resilient when no model is loaded.
     return prompt
@@ -2695,6 +2880,1291 @@ def _extract_content_parts(
     return system_prompt, chat_messages, first_image_b64
 
 
+def _inject_system_text_into_payload(
+    payload: ChatCompletionRequest,
+    injected_text: str,
+) -> ChatCompletionRequest:
+    """Return a payload copy with injected system text prepended safely."""
+    if not injected_text:
+        return payload
+
+    messages = [m.model_copy(deep = True) for m in payload.messages]
+    if (
+        messages
+        and messages[0].role == "system"
+        and isinstance(messages[0].content, str)
+    ):
+        existing = messages[0].content or ""
+        merged = (
+            existing.rstrip() + "\n\n" + injected_text
+            if existing.strip()
+            else injected_text
+        )
+        messages[0] = messages[0].model_copy(update = {"content": merged})
+    else:
+        messages.insert(0, ChatMessage(role = "system", content = injected_text))
+
+    return payload.model_copy(update = {"messages": messages})
+
+
+def _apply_route_rag_history_hooks_to_payload(
+    payload: ChatCompletionRequest,
+    *,
+    request_label: str,
+) -> ChatCompletionRequest:
+    """Apply route-level wiki ingest + RAG prompt injection for upstream paths."""
+    try:
+        system_prompt, chat_messages, _ = _extract_content_parts(payload.messages)
+        if _looks_like_title_generation_request(system_prompt, chat_messages):
+            logger.debug(
+                "Skipping %s RAG/wiki-history hooks for auto-title request",
+                request_label,
+            )
+            return payload
+
+        if _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT > 0:
+            _ingest_pending_raw_files(
+                max_files = _PENDING_RAW_INGEST_MAX_FILES_PER_CHAT,
+            )
+
+        if chat_messages:
+            last_user_msg = next(
+                (m for m in reversed(chat_messages) if m.get("role") == "user"),
+                None,
+            )
+            last_user_text = (
+                str(last_user_msg.get("content", "")).strip()
+                if last_user_msg
+                else ""
+            )
+
+            if last_user_text:
+                rag_context, rag_debug = _get_route_rag_context(
+                    last_user_text,
+                    return_debug = True,
+                    debug_source = "last-request",
+                )
+                global _LAST_RAG_DEBUG
+                _LAST_RAG_DEBUG = rag_debug
+                selected_pages = [
+                    str(item.get("page", "unknown"))
+                    for item in rag_debug.get("selected", [])
+                ]
+                ranking_mode = str(
+                    rag_debug.get("ranking_mode", "unknown") or "unknown"
+                )
+                logger.info(
+                    "RAG selection for %s request: rank_mode=%s pages=%d chars=%d selected=%s query=%r",
+                    request_label,
+                    ranking_mode,
+                    len(selected_pages),
+                    len(rag_context),
+                    selected_pages,
+                    last_user_text,
+                )
+
+                if rag_context:
+                    logger.info("Injecting RAG context into %s prompt", request_label)
+                    if _RAG_LOG_INJECTED_CONTEXT:
+                        logger.info(
+                            "Injected RAG context:\n%s",
+                            _loggable_rag_context(rag_context),
+                        )
+                    rag_block = (
+                        "Use the following context to help answer the user's request:\n\n"
+                        f"{rag_context}"
+                    )
+                    payload = _inject_system_text_into_payload(payload, rag_block)
+                else:
+                    logger.info(
+                        "RAG produced empty context for %s request",
+                        request_label,
+                    )
+
+            _save_chat_history_to_route_wiki(chat_messages)
+    except Exception as exc:
+        logger.warning(
+            "Failed to apply %s RAG/wiki history hooks: %s",
+            request_label,
+            exc,
+        )
+
+    return payload
+
+
+def _build_openai_upstream_body(
+    payload: ChatCompletionRequest,
+    model_name: str,
+) -> dict[str, Any]:
+    body = payload.model_dump(exclude_none = True)
+    body["messages"] = _openai_messages_for_passthrough(payload)
+    body["model"] = model_name
+    for field in _UNSLOTH_ONLY_OPENAI_FIELDS:
+        body.pop(field, None)
+    if payload.enable_thinking is not None and _llm_upstream_forward_thinking_enabled():
+        existing = body.get("chat_template_kwargs")
+        chat_template_kwargs = existing if isinstance(existing, dict) else {}
+        chat_template_kwargs["enable_thinking"] = bool(payload.enable_thinking)
+        body["chat_template_kwargs"] = chat_template_kwargs
+
+    # OpenAI SDK's extra_body concept: merge arbitrary provider-specific
+    # fields into the top-level JSON request for upstream providers.
+    extra_body = body.pop("extra_body", None)
+    if isinstance(extra_body, dict):
+        for key, value in extra_body.items():
+            if (
+                key in body
+                and isinstance(body.get(key), dict)
+                and isinstance(value, dict)
+            ):
+                merged = dict(body.get(key) or {})
+                merged.update(value)
+                body[key] = merged
+            else:
+                body[key] = value
+
+    return body
+
+
+def _build_openai_streaming_response_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _openai_sse_chunks_from_non_streaming_payload(
+    payload: dict[str, Any],
+    default_model: str,
+) -> list[str]:
+    completion_id = str(payload.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}")
+    created = _as_int(payload.get("created"), int(time.time()))
+    model = str(payload.get("model") or default_model)
+
+    choices = payload.get("choices")
+    first_choice = choices[0] if isinstance(choices, list) and choices else {}
+    first_choice = first_choice if isinstance(first_choice, dict) else {}
+    message = first_choice.get("message")
+    message = message if isinstance(message, dict) else {}
+
+    content = message.get("content")
+    if content is None:
+        content = ""
+    if not isinstance(content, str):
+        content = str(content)
+
+    finish_reason = first_choice.get("finish_reason")
+    if finish_reason not in {"stop", "length"}:
+        finish_reason = "stop"
+
+    lines: list[str] = []
+
+    role_chunk = ChatCompletionChunk(
+        id = completion_id,
+        created = created,
+        model = model,
+        choices = [
+            ChunkChoice(
+                delta = ChoiceDelta(role = "assistant"),
+                finish_reason = None,
+            )
+        ],
+    )
+    lines.append(f"data: {role_chunk.model_dump_json(exclude_none = True)}\n\n")
+
+    if content:
+        content_chunk = ChatCompletionChunk(
+            id = completion_id,
+            created = created,
+            model = model,
+            choices = [
+                ChunkChoice(
+                    delta = ChoiceDelta(content = content),
+                    finish_reason = None,
+                )
+            ],
+        )
+        lines.append(f"data: {content_chunk.model_dump_json(exclude_none = True)}\n\n")
+
+    final_chunk = ChatCompletionChunk(
+        id = completion_id,
+        created = created,
+        model = model,
+        choices = [
+            ChunkChoice(
+                delta = ChoiceDelta(),
+                finish_reason = finish_reason,
+            )
+        ],
+    )
+    lines.append(f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n")
+
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        usage_chunk = ChatCompletionChunk(
+            id = completion_id,
+            created = created,
+            model = model,
+            choices = [],
+            usage = CompletionUsage(
+                prompt_tokens = _as_int(usage.get("prompt_tokens"), 0),
+                completion_tokens = _as_int(usage.get("completion_tokens"), 0),
+                total_tokens = _as_int(usage.get("total_tokens"), 0),
+            ),
+            timings = payload.get("timings")
+            if isinstance(payload.get("timings"), dict)
+            else None,
+        )
+        lines.append(f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n")
+
+    lines.append("data: [DONE]\n\n")
+    return lines
+
+
+def _openai_streaming_response_from_payload(
+    payload: dict[str, Any],
+    default_model: str,
+) -> StreamingResponse:
+    lines = _openai_sse_chunks_from_non_streaming_payload(payload, default_model)
+
+    async def _stream():
+        for line in lines:
+            yield line
+
+    return StreamingResponse(
+        _stream(),
+        media_type = "text/event-stream",
+        headers = _build_openai_streaming_response_headers(),
+    )
+
+
+def _upstream_builtin_tools_for_payload(payload: ChatCompletionRequest) -> list[dict]:
+    from core.inference.tools import ALL_TOOLS
+
+    if payload.enabled_tools is None:
+        return list(ALL_TOOLS)
+    enabled = set(payload.enabled_tools)
+    return [
+        tool
+        for tool in ALL_TOOLS
+        if tool.get("function", {}).get("name") in enabled
+    ]
+
+
+def _upstream_tool_use_nudge(model_name: str, tools_to_use: list[dict]) -> str:
+    _tool_names = {tool.get("function", {}).get("name", "") for tool in tools_to_use}
+    _has_web = "web_search" in _tool_names
+    _has_code = "python" in _tool_names or "terminal" in _tool_names
+
+    _date_line = f"The current date is {_date.today().isoformat()}."
+
+    _model_size_b = _extract_model_size_b(model_name)
+    _is_small_model = _model_size_b is not None and _model_size_b < 9
+
+    if _is_small_model:
+        _web_tips = "Do not repeat the same search query."
+    else:
+        _web_tips = (
+            "When you search and find a relevant URL in the results, "
+            "fetch its full content by calling web_search with the url parameter. "
+            "Do not repeat the same search query. If a search returns "
+            "no useful results, try rephrasing or fetching a result URL directly."
+        )
+    _code_tips = (
+        "Use code execution for math, calculations, data processing, "
+        "or to parse and analyze information from tool results."
+    )
+
+    if _has_web and _has_code:
+        _nudge = (
+            _date_line
+            + " "
+            + "You have access to tools. When appropriate, prefer using "
+            + "tools rather than answering from memory. "
+            + _web_tips
+            + " "
+            + _code_tips
+        )
+    elif _has_code:
+        _nudge = (
+            _date_line
+            + " "
+            + "You have access to tools. When appropriate, prefer using "
+            + "code execution rather than answering from memory. "
+            + _code_tips
+        )
+    elif _has_web:
+        _nudge = (
+            _date_line
+            + " "
+            + "You have access to tools. When appropriate, prefer using "
+            + "web search for up-to-date or uncertain factual "
+            + "information rather than answering from memory. "
+            + _web_tips
+        )
+    else:
+        _nudge = ""
+
+    if _nudge:
+        _nudge += _TOOL_ACTION_NUDGE
+    return _nudge
+
+
+def _inject_tool_nudge_into_openai_messages(messages: list[dict], nudge: str) -> None:
+    if not nudge:
+        return
+    if (
+        messages
+        and messages[0].get("role") == "system"
+        and isinstance(messages[0].get("content"), str)
+    ):
+        messages[0]["content"] = messages[0]["content"].rstrip() + "\n\n" + nudge
+    else:
+        messages.insert(0, {"role": "system", "content": nudge})
+
+
+def _strip_tool_xml_from_assistant_messages(messages: list[dict]) -> None:
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = _TOOL_XML_RE.sub("", content).strip()
+
+
+def _parse_tool_call_arguments(raw_args: Any, auto_heal: bool) -> dict:
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+        except (json.JSONDecodeError, ValueError):
+            if auto_heal:
+                return {"query": raw_args}
+            return {"raw": raw_args}
+    return {}
+
+
+def _tool_status_text(tool_name: str, arguments: dict) -> str:
+    if tool_name == "web_search":
+        _ws_url = str(arguments.get("url") or "").strip()
+        if _ws_url:
+            _parsed = urlparse(_ws_url)
+            if _parsed.scheme in ("http", "https") and _parsed.hostname:
+                _ws_host = _parsed.hostname
+                if _ws_host.startswith("www."):
+                    _ws_host = _ws_host[4:]
+                return f"Reading: {_ws_host}"
+            return "Reading page..."
+        return f"Searching: {arguments.get('query', '')}"
+    if tool_name == "python":
+        preview = str(arguments.get("code") or "").strip().split("\n")[0][:60]
+        return f"Running Python: {preview}" if preview else "Running Python..."
+    if tool_name == "terminal":
+        cmd_preview = str(arguments.get("command") or "")[:60]
+        return f"Running: {cmd_preview}" if cmd_preview else "Running command..."
+    return f"Calling: {tool_name}"
+
+
+def _valid_finish_reason(value: Any) -> str:
+    return value if value in {"stop", "length"} else "stop"
+
+
+def _build_upstream_tool_loop_request_body(
+    base_body: dict[str, Any],
+    conversation: list[dict],
+    *,
+    tools: Optional[list[dict]] = None,
+    tool_choice: Any = None,
+) -> dict[str, Any]:
+    body = dict(base_body)
+    body["stream"] = False
+    body["messages"] = conversation
+    if tools is None:
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        return body
+    body["tools"] = tools
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
+    else:
+        body.setdefault("tool_choice", "auto")
+    return body
+
+
+async def _openai_upstream_chat_non_streaming_json_from_body(
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    target_url = f"{_llm_upstream_base_url()}/chat/completions"
+
+    try:
+        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                target_url,
+                json = body,
+                headers = _llm_upstream_headers(),
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Failed to reach upstream model server: {exc}",
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code = resp.status_code,
+            detail = f"Upstream model server error: {resp.text[:500]}",
+        )
+
+    try:
+        parsed = resp.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Upstream model server returned invalid JSON: {exc}",
+        )
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = "Upstream model server returned invalid response payload.",
+        )
+    return parsed
+
+
+def _upstream_tool_loop_usage(
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> CompletionUsage:
+    return CompletionUsage(
+        prompt_tokens = max(0, prompt_tokens),
+        completion_tokens = max(0, completion_tokens),
+        total_tokens = max(0, prompt_tokens) + max(0, completion_tokens),
+    )
+
+
+def _upstream_empty_assistant_fallback(last_tool_name: str, last_tool_result: str) -> str:
+    tool_result = (last_tool_result or "").strip()
+    if tool_result:
+        preview = tool_result
+        if len(preview) > 1200:
+            preview = preview[:1200].rstrip() + "..."
+        if last_tool_name:
+            return (
+                f"I could not produce a final answer after calling {last_tool_name}. "
+                "Here is the most recent tool output:\n\n"
+                f"{preview}"
+            )
+        return (
+            "I could not produce a final answer in this attempt. "
+            "Here is the most recent tool output:\n\n"
+            f"{preview}"
+        )
+    return (
+        "I could not generate a final answer for this request. "
+        "Please try again or disable tools for this message."
+    )
+
+
+def _upstream_server_tools_enabled(payload: ChatCompletionRequest) -> bool:
+    if not payload.enable_tools:
+        return False
+    max_iters = payload.max_tool_calls_per_message
+    if max_iters is None:
+        return True
+    return max_iters > 0
+
+
+async def _openai_upstream_tool_loop_events(
+    payload: ChatCompletionRequest,
+    model_name: str,
+    *,
+    request: Optional[Request] = None,
+):
+    from core.inference.tools import execute_tool
+
+    tools_to_use = _upstream_builtin_tools_for_payload(payload)
+    if not tools_to_use:
+        raise HTTPException(
+            status_code = 400,
+            detail = "No upstream tools are enabled for this request.",
+        )
+
+    tool_names = {
+        tool.get("function", {}).get("name", "")
+        for tool in tools_to_use
+    }
+
+    base_body = _build_openai_upstream_body(payload, model_name)
+    conversation = list(base_body.get("messages") or [])
+
+    nudge = _upstream_tool_use_nudge(model_name, tools_to_use)
+    _inject_tool_nudge_into_openai_messages(conversation, nudge)
+    _strip_tool_xml_from_assistant_messages(conversation)
+
+    auto_heal = payload.auto_heal_tool_calls if payload.auto_heal_tool_calls is not None else True
+    max_tool_iterations = payload.max_tool_calls_per_message
+    if max_tool_iterations is None:
+        max_tool_iterations = 25
+    max_tool_iterations = max(0, max_tool_iterations)
+
+    completion_tokens_total = 0
+    prompt_tokens_last = 0
+    timings_last: Optional[dict] = None
+    saw_usage = False
+    emitted_any_content = False
+    last_tool_name = ""
+    last_tool_result = ""
+
+    async def _call_step(tools: Optional[list[dict]], tool_choice: Any = None) -> dict[str, Any]:
+        body = _build_upstream_tool_loop_request_body(
+            base_body,
+            conversation,
+            tools = tools,
+            tool_choice = tool_choice,
+        )
+        return await _openai_upstream_chat_non_streaming_json_from_body(body)
+
+    for iteration in range(max_tool_iterations):
+        if request is not None and await request.is_disconnected():
+            return
+
+        response_payload = await _call_step(tools_to_use, tool_choice = "auto")
+
+        usage = response_payload.get("usage")
+        if isinstance(usage, dict):
+            saw_usage = True
+            completion_tokens_total += _as_int(usage.get("completion_tokens"), 0)
+            prompt_tokens_last = _as_int(usage.get("prompt_tokens"), prompt_tokens_last)
+        timings = response_payload.get("timings")
+        if isinstance(timings, dict):
+            timings_last = timings
+
+        choices = response_payload.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        if not isinstance(choice, dict):
+            choice = {}
+
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            message = {}
+
+        finish_reason = _valid_finish_reason(choice.get("finish_reason"))
+
+        raw_content = message.get("content")
+        content = _openai_text_from_content_parts(raw_content)
+        if not content:
+            content = _openai_text_from_content_parts(message.get("output_text"))
+        if not content and isinstance(choice.get("text"), str):
+            content = str(choice.get("text") or "").strip()
+        if auto_heal and content:
+            content = _TOOL_XML_RE.sub("", content).strip()
+
+        raw_tool_calls = message.get("tool_calls")
+        tool_calls = [
+            tc
+            for tc in (raw_tool_calls if isinstance(raw_tool_calls, list) else [])
+            if isinstance(tc, dict)
+        ]
+
+        assistant_msg: dict[str, Any] = {"role": "assistant"}
+        if raw_content is not None:
+            assistant_msg["content"] = raw_content
+        elif tool_calls:
+            assistant_msg["content"] = None
+        else:
+            assistant_msg["content"] = ""
+        if (
+            "reasoning_content" in message
+            and message.get("reasoning_content") is not None
+        ):
+            # Some providers require replaying prior reasoning traces on
+            # subsequent tool-loop turns when thinking mode is enabled.
+            assistant_msg["reasoning_content"] = message.get("reasoning_content")
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        conversation.append(assistant_msg)
+
+        if content:
+            yield {"type": "content", "text": content}
+            emitted_any_content = True
+
+        if not tool_calls:
+            if not emitted_any_content:
+                fallback_text = _upstream_empty_assistant_fallback(
+                    last_tool_name,
+                    last_tool_result,
+                )
+                yield {"type": "content", "text": fallback_text}
+                emitted_any_content = True
+            yield {
+                "type": "final",
+                "finish_reason": finish_reason,
+                "usage": _upstream_tool_loop_usage(prompt_tokens_last, completion_tokens_total)
+                if saw_usage
+                else None,
+                "timings": timings_last,
+            }
+            return
+
+        for idx, tc in enumerate(tool_calls):
+            if request is not None and await request.is_disconnected():
+                return
+
+            func = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            tool_name = str(func.get("name") or "").strip()
+            raw_args = func.get("arguments", {})
+            arguments = _parse_tool_call_arguments(raw_args, auto_heal = auto_heal)
+            tool_call_id = str(tc.get("id") or f"call_{iteration}_{idx}")
+
+            yield {"type": "status", "text": _tool_status_text(tool_name, arguments)}
+            yield {
+                "type": "tool_start",
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "arguments": arguments,
+            }
+
+            timeout_value = payload.tool_call_timeout if payload.tool_call_timeout is not None else 300
+            effective_timeout = None if timeout_value >= 9999 else timeout_value
+
+            if tool_name not in tool_names:
+                result = f"Tool '{tool_name}' is not enabled for this request."
+            else:
+                try:
+                    result = execute_tool(
+                        tool_name,
+                        arguments,
+                        cancel_event = None,
+                        timeout = effective_timeout,
+                        session_id = payload.session_id,
+                    )
+                except Exception as exc:
+                    result = f"Error executing {tool_name}: {exc}"
+
+            if not isinstance(result, str):
+                result = str(result)
+
+            yield {
+                "type": "tool_end",
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "result": result,
+            }
+
+            last_tool_name = tool_name
+            tool_result_for_model = result
+            if "\n__IMAGES__:" in tool_result_for_model:
+                tool_result_for_model = tool_result_for_model.rsplit("\n__IMAGES__:", 1)[0]
+            last_tool_result = tool_result_for_model
+
+            tool_msg: dict[str, Any] = {
+                "role": "tool",
+                "name": tool_name,
+                "content": tool_result_for_model,
+                "tool_call_id": tool_call_id,
+            }
+            conversation.append(tool_msg)
+
+        yield {"type": "status", "text": ""}
+
+    # Tool budget reached: force final answer without more tool calls.
+    conversation.append(
+        {
+            "role": "user",
+            "content": (
+                "You have used all available tool calls. Based on everything you "
+                "have found so far, provide your final answer now. Do not call any "
+                "more tools."
+            ),
+        }
+    )
+
+    if request is not None and await request.is_disconnected():
+        return
+
+    response_payload = await _call_step([], tool_choice = "none")
+
+    usage = response_payload.get("usage")
+    if isinstance(usage, dict):
+        saw_usage = True
+        completion_tokens_total += _as_int(usage.get("completion_tokens"), 0)
+        prompt_tokens_last = _as_int(usage.get("prompt_tokens"), prompt_tokens_last)
+    timings = response_payload.get("timings")
+    if isinstance(timings, dict):
+        timings_last = timings
+
+    choices = response_payload.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    if not isinstance(choice, dict):
+        choice = {}
+
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        message = {}
+
+    finish_reason = _valid_finish_reason(choice.get("finish_reason"))
+
+    content = _openai_text_from_content_parts(message.get("content"))
+    if not content:
+        content = _openai_text_from_content_parts(message.get("output_text"))
+    if not content and isinstance(choice.get("text"), str):
+        content = str(choice.get("text") or "").strip()
+    if auto_heal and content:
+        content = _TOOL_XML_RE.sub("", content).strip()
+    if not content:
+        content = _upstream_empty_assistant_fallback(last_tool_name, last_tool_result)
+    if content:
+        yield {"type": "content", "text": content}
+        emitted_any_content = True
+
+    yield {
+        "type": "final",
+        "finish_reason": finish_reason,
+        "usage": _upstream_tool_loop_usage(prompt_tokens_last, completion_tokens_total)
+        if saw_usage
+        else None,
+        "timings": timings_last,
+    }
+
+
+async def _openai_upstream_chat_tools_stream(
+    request: Request,
+    payload: ChatCompletionRequest,
+    model_name: str,
+):
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    async def _stream():
+        try:
+            first_chunk = ChatCompletionChunk(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [
+                    ChunkChoice(
+                        delta = ChoiceDelta(role = "assistant"),
+                        finish_reason = None,
+                    )
+                ],
+            )
+            yield f"data: {first_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+            async for event in _openai_upstream_tool_loop_events(
+                payload,
+                model_name,
+                request = request,
+            ):
+                event_type = event.get("type")
+                if event_type == "status":
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "tool_status",
+                                "content": str(event.get("text") or ""),
+                            }
+                        )
+                        + "\n\n"
+                    )
+                    continue
+                if event_type in {"tool_start", "tool_end"}:
+                    yield f"data: {json.dumps(event)}\n\n"
+                    continue
+                if event_type == "content":
+                    chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(content = str(event.get("text") or "")),
+                                finish_reason = None,
+                            )
+                        ],
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_none = True)}\n\n"
+                    continue
+                if event_type == "final":
+                    final_chunk = ChatCompletionChunk(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            ChunkChoice(
+                                delta = ChoiceDelta(),
+                                finish_reason = _valid_finish_reason(event.get("finish_reason")),
+                            )
+                        ],
+                    )
+                    yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+                    usage = event.get("usage")
+                    timings = event.get("timings")
+                    if usage or timings:
+                        usage_chunk = ChatCompletionChunk(
+                            id = completion_id,
+                            created = created,
+                            model = model_name,
+                            choices = [],
+                            usage = usage if isinstance(usage, CompletionUsage) else None,
+                            timings = timings if isinstance(timings, dict) else None,
+                        )
+                        yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n"
+
+                    yield "data: [DONE]\n\n"
+                    return
+
+            # Safety fallback if loop exits without explicit final event.
+            final_chunk = ChatCompletionChunk(
+                id = completion_id,
+                created = created,
+                model = model_name,
+                choices = [
+                    ChunkChoice(
+                        delta = ChoiceDelta(),
+                        finish_reason = "stop",
+                    )
+                ],
+            )
+            yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
+            yield "data: [DONE]\n\n"
+        except HTTPException as exc:
+            err = {
+                "error": {
+                    "message": str(exc.detail),
+                    "type": "server_error",
+                }
+            }
+            yield f"data: {json.dumps(err)}\n\n"
+        except Exception as exc:
+            logger.error("openai upstream server-tools stream error: %s", exc)
+            err = {
+                "error": {
+                    "message": f"Failed to run upstream tool loop: {exc}",
+                    "type": "server_error",
+                }
+            }
+            yield f"data: {json.dumps(err)}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type = "text/event-stream",
+        headers = _build_openai_streaming_response_headers(),
+    )
+
+
+async def _openai_upstream_chat_tools_non_streaming(
+    payload: ChatCompletionRequest,
+    model_name: str,
+):
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    final_text_parts: list[str] = []
+    final_finish_reason = "stop"
+    final_usage: Optional[CompletionUsage] = None
+
+    async for event in _openai_upstream_tool_loop_events(payload, model_name):
+        event_type = event.get("type")
+        if event_type == "content":
+            final_text_parts.append(str(event.get("text") or ""))
+            continue
+        if event_type == "final":
+            final_finish_reason = _valid_finish_reason(event.get("finish_reason"))
+            usage = event.get("usage")
+            if isinstance(usage, CompletionUsage):
+                final_usage = usage
+
+    response = ChatCompletion(
+        id = completion_id,
+        created = created,
+        model = model_name,
+        choices = [
+            CompletionChoice(
+                message = CompletionMessage(content = "".join(final_text_parts)),
+                finish_reason = final_finish_reason,
+            )
+        ],
+        usage = final_usage or CompletionUsage(),
+    )
+    return JSONResponse(content = response.model_dump())
+
+
+def _parse_openai_non_streaming_payload(raw_payload: bytes) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw_payload.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Upstream non-streaming fallback returned invalid JSON: {exc}",
+        )
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = "Upstream non-streaming fallback returned invalid payload.",
+        )
+    return parsed
+
+
+async def _openai_upstream_chat_non_streaming_raw(
+    payload: ChatCompletionRequest,
+    model_name: str,
+) -> bytes:
+    target_url = f"{_llm_upstream_base_url()}/chat/completions"
+    body = _build_openai_upstream_body(payload, model_name)
+    body["stream"] = False
+
+    try:
+        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                target_url,
+                json = body,
+                headers = _llm_upstream_headers(),
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Failed to reach upstream model server: {exc}",
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code = resp.status_code,
+            detail = f"Upstream model server error: {resp.text[:500]}",
+        )
+
+    return resp.content
+
+
+async def _openai_upstream_stream_via_non_streaming(
+    payload: ChatCompletionRequest,
+    model_name: str,
+) -> StreamingResponse:
+    raw_payload = await _openai_upstream_chat_non_streaming_raw(payload, model_name)
+    parsed = _parse_openai_non_streaming_payload(raw_payload)
+    return _openai_streaming_response_from_payload(parsed, model_name)
+
+
+async def _openai_upstream_chat_stream(
+    request: Request,
+    payload: ChatCompletionRequest,
+    model_name: str,
+):
+    fallback_enabled = _llm_upstream_auto_stream_fallback_enabled(
+        payload.upstream_auto_stream_fallback,
+    )
+    if (
+        fallback_enabled
+        and payload.enable_thinking
+        and _known_upstream_stream_thinking_compat(model_name) is False
+    ):
+        logger.info(
+            "Upstream stream fallback pre-check triggered for model=%s",
+            model_name,
+        )
+        return await _openai_upstream_stream_via_non_streaming(payload, model_name)
+
+    target_url = f"{_llm_upstream_base_url()}/chat/completions"
+    body = _build_openai_upstream_body(payload, model_name)
+    body["stream"] = True
+
+    client = httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS)
+    resp = None
+    try:
+        req = client.build_request(
+            "POST",
+            target_url,
+            json = body,
+            headers = _llm_upstream_headers(),
+        )
+        resp = await client.send(req, stream = True)
+    except httpx.RequestError as exc:
+        if resp is not None:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Failed to reach upstream model server: {exc}",
+        )
+
+    if resp.status_code != 200:
+        err_bytes = await resp.aread()
+        err_text = err_bytes.decode("utf-8", errors = "replace")
+        upstream_status = resp.status_code
+        try:
+            await resp.aclose()
+        except Exception:
+            pass
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code = upstream_status,
+            detail = f"Upstream model server error: {err_text[:500]}",
+        )
+
+    content_type = str(resp.headers.get("content-type", "")).lower()
+    if "text/event-stream" not in content_type:
+        logger.warning(
+            "Upstream stream requested but server returned non-SSE content-type=%s; "
+            "falling back to non-streaming payload conversion.",
+            content_type or "<missing>",
+        )
+        try:
+            raw_payload = await resp.aread()
+            parsed = _parse_openai_non_streaming_payload(raw_payload)
+            return _openai_streaming_response_from_payload(parsed, model_name)
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    async def _stream():
+        lines_iter = None
+        saw_data_line = False
+        saw_done = False
+        client_disconnected = False
+        try:
+            lines_iter = resp.aiter_lines()
+            async for raw_line in lines_iter:
+                if await request.is_disconnected():
+                    client_disconnected = True
+                    break
+                if not raw_line:
+                    continue
+                if not raw_line.startswith("data: "):
+                    continue
+                saw_data_line = True
+                yield raw_line + "\n\n"
+                if raw_line[6:].strip() == "[DONE]":
+                    saw_done = True
+                    break
+            if client_disconnected:
+                return
+            if not saw_data_line:
+                logger.warning(
+                    "Upstream stream completed with no SSE data lines for model=%s; "
+                    "falling back to non-streaming for this request.",
+                    model_name,
+                )
+                if payload.enable_thinking and fallback_enabled:
+                    _remember_upstream_stream_thinking_compat(model_name, False)
+                try:
+                    raw_payload = await _openai_upstream_chat_non_streaming_raw(
+                        payload,
+                        model_name,
+                    )
+                    parsed = _parse_openai_non_streaming_payload(raw_payload)
+                    for line in _openai_sse_chunks_from_non_streaming_payload(
+                        parsed,
+                        model_name,
+                    ):
+                        yield line
+                    return
+                except Exception as fallback_exc:
+                    logger.error(
+                        "Upstream no-data stream fallback failed: %s",
+                        fallback_exc,
+                    )
+                    err = {
+                        "error": {
+                            "message": (
+                                "Upstream stream returned no tokens and fallback failed: "
+                                f"{fallback_exc}"
+                            ),
+                            "type": "server_error",
+                        },
+                    }
+                    yield f"data: {json.dumps(err)}\n\n"
+                    return
+            if payload.enable_thinking and fallback_enabled and saw_done:
+                _remember_upstream_stream_thinking_compat(model_name, True)
+        except Exception as exc:
+            logger.error("openai upstream stream error: %s", exc)
+            if payload.enable_thinking and fallback_enabled and not saw_data_line:
+                _remember_upstream_stream_thinking_compat(model_name, False)
+                logger.warning(
+                    "Upstream stream failed before first token for model=%s; "
+                    "falling back to non-streaming for this request.",
+                    model_name,
+                )
+                try:
+                    raw_payload = await _openai_upstream_chat_non_streaming_raw(
+                        payload,
+                        model_name,
+                    )
+                    parsed = _parse_openai_non_streaming_payload(raw_payload)
+                    for line in _openai_sse_chunks_from_non_streaming_payload(
+                        parsed,
+                        model_name,
+                    ):
+                        yield line
+                    return
+                except Exception as fallback_exc:
+                    logger.error(
+                        "Upstream non-streaming fallback failed: %s",
+                        fallback_exc,
+                    )
+            err = {
+                "error": {
+                    "message": f"Failed to stream from upstream model server: {exc}",
+                    "type": "server_error",
+                },
+            }
+            yield f"data: {json.dumps(err)}\n\n"
+        finally:
+            if lines_iter is not None:
+                try:
+                    await lines_iter.aclose()
+                except Exception:
+                    pass
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _stream(),
+        media_type = "text/event-stream",
+        headers = _build_openai_streaming_response_headers(),
+    )
+
+
+async def _openai_upstream_chat_non_streaming(
+    payload: ChatCompletionRequest,
+    model_name: str,
+):
+    raw_payload = await _openai_upstream_chat_non_streaming_raw(payload, model_name)
+    return Response(content = raw_payload, media_type = "application/json")
+
+
+async def _openai_upstream_passthrough(
+    request: Request,
+    endpoint: str,
+    *,
+    allow_stream: bool,
+):
+    body = await request.json()
+    target_url = f"{_llm_upstream_base_url()}/{endpoint.lstrip('/')}"
+    wants_stream = bool(body.get("stream", False)) if allow_stream else False
+
+    if wants_stream:
+        client = httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS)
+        resp = None
+        try:
+            req = client.build_request(
+                "POST",
+                target_url,
+                json = body,
+                headers = _llm_upstream_headers(),
+            )
+            resp = await client.send(req, stream = True)
+        except httpx.RequestError as exc:
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code = status.HTTP_502_BAD_GATEWAY,
+                detail = f"Failed to reach upstream model server: {exc}",
+            )
+
+        if resp.status_code != 200:
+            err_bytes = await resp.aread()
+            err_text = err_bytes.decode("utf-8", errors = "replace")
+            upstream_status = resp.status_code
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code = upstream_status,
+                detail = f"Upstream model server error: {err_text[:500]}",
+            )
+
+        async def _stream():
+            bytes_iter = None
+            try:
+                bytes_iter = resp.aiter_bytes()
+                async for chunk in bytes_iter:
+                    if await request.is_disconnected():
+                        break
+                    if chunk:
+                        yield chunk
+            except Exception as exc:
+                logger.error("openai upstream %s stream error: %s", endpoint, exc)
+            finally:
+                if bytes_iter is not None:
+                    try:
+                        await bytes_iter.aclose()
+                    except Exception:
+                        pass
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+
+        return StreamingResponse(_stream(), media_type = "text/event-stream")
+
+    try:
+        async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                target_url,
+                json = body,
+                headers = _llm_upstream_headers(),
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = f"Failed to reach upstream model server: {exc}",
+        )
+
+    return Response(
+        content = resp.content,
+        status_code = resp.status_code,
+        media_type = "application/json",
+    )
 def _looks_like_title_generation_request(
     system_prompt: str,
     chat_messages: list[dict],

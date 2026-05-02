@@ -28,6 +28,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { sentAudioNames } from "@/features/chat/api/chat-adapter";
@@ -388,77 +389,154 @@ const ReasoningToggle: FC = () => {
   );
   const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
   const supportsReasoning = useChatRuntimeStore((s) => s.supportsReasoning);
+  const reasoningAlwaysOn = useChatRuntimeStore((s) => s.reasoningAlwaysOn);
   const reasoningEnabled = useChatRuntimeStore((s) => s.reasoningEnabled);
   const setReasoningEnabled = useChatRuntimeStore((s) => s.setReasoningEnabled);
   const reasoningStyle = useChatRuntimeStore((s) => s.reasoningStyle);
+  const setReasoningStyle = useChatRuntimeStore((s) => s.setReasoningStyle);
   const reasoningEffort = useChatRuntimeStore((s) => s.reasoningEffort);
   const setReasoningEffort = useChatRuntimeStore((s) => s.setReasoningEffort);
-  const disabled = !(modelLoaded && supportsReasoning);
-
-  if (reasoningStyle === "reasoning_effort") {
-    return (
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild={true}>
-          <button
-            type="button"
-            disabled={disabled}
-            className={cn(
-              "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-              disabled
-                ? "cursor-not-allowed opacity-40"
-                : "bg-primary/10 text-primary hover:bg-primary/20",
-            )}
-            aria-label={`Reasoning effort: ${reasoningEffort}`}
-          >
-            <LightbulbIcon className="size-3.5" />
-            <span>
-              Think:{" "}
-              {reasoningEffort.charAt(0).toUpperCase() +
-                reasoningEffort.slice(1)}
-            </span>
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          {(["low", "medium", "high"] as const).map((level) => (
-            <DropdownMenuItem
-              key={level}
-              onSelect={() => setReasoningEffort(level)}
-            >
-              {level.charAt(0).toUpperCase() + level.slice(1)}
-              {reasoningEffort === level ? " \u2713" : ""}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
-    );
-  }
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled = !controlsReady || (!useUpstream && !supportsReasoning);
+  const reasoningOn = reasoningAlwaysOn || reasoningStyle === "reasoning_effort" || reasoningEnabled;
+  const toggleDisabled = disabled || reasoningStyle !== "enable_thinking" || reasoningAlwaysOn;
+  const buttonLabel =
+    reasoningStyle === "reasoning_effort"
+      ? `Think: ${reasoningEffort.charAt(0).toUpperCase() + reasoningEffort.slice(1)}`
+      : "Think";
 
   return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={() => {
-        const next = !reasoningEnabled;
-        setReasoningEnabled(next);
-        applyQwenThinkingParams(next);
-      }}
-      className={cn(
-        "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
-        disabled
-          ? "cursor-not-allowed opacity-40"
-          : reasoningEnabled
-            ? "bg-primary/10 text-primary hover:bg-primary/20"
-            : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
-      )}
-      aria-label={reasoningEnabled ? "Disable thinking" : "Enable thinking"}
-    >
-      {reasoningEnabled && !disabled ? (
-        <LightbulbIcon className="size-3.5" />
-      ) : (
-        <LightbulbOffIcon className="size-3.5" />
-      )}
-      <span>Think</span>
-    </button>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild={true}>
+        <button
+          type="button"
+          disabled={disabled}
+          className={cn(
+            "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+            disabled
+              ? "cursor-not-allowed opacity-40"
+              : reasoningOn
+                ? "bg-primary/10 text-primary hover:bg-primary/20"
+                : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+          )}
+          aria-label={buttonLabel}
+        >
+          {reasoningOn && !disabled ? (
+            <LightbulbIcon className="size-3.5" />
+          ) : (
+            <LightbulbOffIcon className="size-3.5" />
+          )}
+          <span>{buttonLabel}</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem
+          disabled={disabled}
+          onSelect={() => setReasoningStyle("enable_thinking")}
+        >
+          Mode: Toggle thinking
+          {reasoningStyle === "enable_thinking" ? " \u2713" : ""}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={disabled}
+          onSelect={() => {
+            setReasoningStyle("reasoning_effort");
+            setReasoningEnabled(true);
+          }}
+        >
+          Mode: Effort based
+          {reasoningStyle === "reasoning_effort" ? " \u2713" : ""}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          disabled={toggleDisabled}
+          onSelect={() => {
+            const next = !reasoningEnabled;
+            setReasoningEnabled(next);
+            applyQwenThinkingParams(next);
+          }}
+        >
+          {reasoningEnabled ? "Disable thinking" : "Enable thinking"}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        {(["low", "medium", "high"] as const).map((level) => (
+          <DropdownMenuItem
+            key={level}
+            disabled={disabled}
+            onSelect={() => {
+              setReasoningStyle("reasoning_effort");
+              setReasoningEffort(level);
+              setReasoningEnabled(true);
+            }}
+          >
+            Effort: {level.charAt(0).toUpperCase() + level.slice(1)}
+            {reasoningStyle === "reasoning_effort" && reasoningEffort === level
+              ? " \u2713"
+              : ""}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+};
+
+const ReasoningEffortControl: FC = () => {
+  const modelLoaded = useChatRuntimeStore(
+    (s) => !!s.params.checkpoint && !s.modelLoading,
+  );
+  const useUpstream = useChatRuntimeStore((s) => s.useUpstream);
+  const supportsReasoning = useChatRuntimeStore((s) => s.supportsReasoning);
+  const reasoningStyle = useChatRuntimeStore((s) => s.reasoningStyle);
+  const reasoningEffort = useChatRuntimeStore((s) => s.reasoningEffort);
+  const setReasoningStyle = useChatRuntimeStore((s) => s.setReasoningStyle);
+  const setReasoningEffort = useChatRuntimeStore((s) => s.setReasoningEffort);
+  const setReasoningEnabled = useChatRuntimeStore((s) => s.setReasoningEnabled);
+
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled = !controlsReady || (!useUpstream && !supportsReasoning);
+  const effortLabel =
+    reasoningEffort.charAt(0).toUpperCase() + reasoningEffort.slice(1);
+  const effortModeActive = reasoningStyle === "reasoning_effort";
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild={true}>
+        <button
+          type="button"
+          disabled={disabled}
+          className={cn(
+            "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+            disabled
+              ? "cursor-not-allowed opacity-40"
+              : effortModeActive
+                ? "bg-primary/10 text-primary hover:bg-primary/20"
+                : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+          )}
+          aria-label={`Reasoning effort: ${reasoningEffort}`}
+        >
+          <GaugeIcon className="size-3.5" />
+          <span>Effort: {effortLabel}</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {(["low", "medium", "high"] as const).map((level) => (
+          <DropdownMenuItem
+            key={level}
+            disabled={disabled}
+            onSelect={() => {
+              setReasoningStyle("reasoning_effort");
+              setReasoningEffort(level);
+              setReasoningEnabled(true);
+            }}
+          >
+            Effort: {level.charAt(0).toUpperCase() + level.slice(1)}
+            {reasoningStyle === "reasoning_effort" && reasoningEffort === level
+              ? " \u2713"
+              : ""}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 };
 
@@ -508,7 +586,8 @@ const WebSearchToggle: FC = () => {
   const supportsTools = useChatRuntimeStore((s) => s.supportsTools);
   const toolsEnabled = useChatRuntimeStore((s) => s.toolsEnabled);
   const setToolsEnabled = useChatRuntimeStore((s) => s.setToolsEnabled);
-  const disabled = !(modelLoaded && supportsTools);
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled = !controlsReady || (!useUpstream && !supportsTools);
 
   return (
     <button
@@ -539,7 +618,8 @@ const CodeToolsToggle: FC = () => {
   const supportsTools = useChatRuntimeStore((s) => s.supportsTools);
   const codeToolsEnabled = useChatRuntimeStore((s) => s.codeToolsEnabled);
   const setCodeToolsEnabled = useChatRuntimeStore((s) => s.setCodeToolsEnabled);
-  const disabled = !(modelLoaded && supportsTools);
+  const controlsReady = modelLoaded || useUpstream;
+  const disabled = !controlsReady || (!useUpstream && !supportsTools);
 
   return (
     <button
@@ -624,16 +704,17 @@ const ToolStatusDisplay: FC = () => {
 
 const ComposerAction: FC<{ disabled?: boolean }> = ({ disabled }) => {
   return (
-    <div className="aui-composer-action-wrapper relative mx-2 mb-2 flex items-center justify-between">
-      <div className="flex items-center gap-1">
+    <div className="aui-composer-action-wrapper relative mx-2 mb-2 flex min-w-0 items-center justify-between">
+      <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto pr-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden [&>*]:shrink-0 [&>*]:whitespace-nowrap">
         <ComposerAddAttachment />
         <ComposerAudioUpload />
         <ReasoningToggle />
+        <ReasoningEffortControl />
         <PreserveThinkingToggle />
         <WebSearchToggle />
         <CodeToolsToggle />
       </div>
-      <div className="flex items-center gap-1">
+      <div className="shrink-0 flex items-center gap-1">
         <ComposerPrimitive.If dictation={false}>
           <ComposerPrimitive.Dictate asChild={true}>
             <TooltipIconButton

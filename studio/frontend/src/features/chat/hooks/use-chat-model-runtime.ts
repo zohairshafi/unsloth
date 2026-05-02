@@ -16,7 +16,10 @@ import {
   validateModel,
 } from "../api/chat-api";
 import { formatEta, formatRate } from "../utils/format-transfer";
-import { useChatRuntimeStore } from "../stores/chat-runtime-store";
+import {
+  resolveReasoningStyle,
+  useChatRuntimeStore,
+} from "../stores/chat-runtime-store";
 import type { InferenceStatusResponse, LoadModelResponse } from "../types/api";
 import type {
   ChatLoraSummary,
@@ -267,7 +270,13 @@ export function useChatModelRuntime() {
         // Restore reasoning/tools support flags and context length
         const supportsReasoning = statusRes.supports_reasoning ?? false;
         const reasoningAlwaysOn = statusRes.reasoning_always_on ?? false;
-        const reasoningStyle = statusRes.reasoning_style ?? "enable_thinking";
+        const currentReasoningStyle = useChatRuntimeStore.getState().reasoningStyle;
+        const reasoningStyle = resolveReasoningStyle(
+          supportsReasoning,
+          reasoningAlwaysOn,
+          statusRes.reasoning_style,
+          currentReasoningStyle,
+        );
         const supportsPreserveThinking = statusRes.supports_preserve_thinking ?? false;
         const supportsTools = statusRes.supports_tools ?? false;
         const currentGgufContextLength = statusRes.is_gguf
@@ -506,6 +515,13 @@ export function useChatModelRuntime() {
             // context state and display the backend-reported effective context.
             const keepCustomCtx = null;
             const reasoningAlwaysOn = loadResponse.reasoning_always_on ?? false;
+            const currentReasoningStyle = useChatRuntimeStore.getState().reasoningStyle;
+            const reasoningStyle = resolveReasoningStyle(
+              loadResponse.supports_reasoning ?? false,
+              reasoningAlwaysOn,
+              loadResponse.reasoning_style,
+              currentReasoningStyle,
+            );
             const ggufMaxContextLength = reportedMaxCtx;
             useChatRuntimeStore.setState({
               ggufContextLength: nativeCtx,
@@ -516,7 +532,7 @@ export function useChatModelRuntime() {
               supportsReasoning: loadResponse.supports_reasoning ?? false,
               reasoningAlwaysOn,
               reasoningEnabled: reasoningAlwaysOn ? true : reasoningDefault,
-              reasoningStyle: loadResponse.reasoning_style ?? "enable_thinking",
+              reasoningStyle,
               supportsPreserveThinking: loadResponse.supports_preserve_thinking ?? false,
               supportsTools: loadResponse.supports_tools ?? false,
               toolsEnabled: loadResponse.supports_tools ?? false,

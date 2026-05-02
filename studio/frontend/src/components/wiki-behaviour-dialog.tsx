@@ -65,6 +65,8 @@ interface WikiBehaviourDialogProps {
 const CATEGORY_ORDER = [
   "Watcher & Ingest",
   "RAG & Logging",
+  "Wiki LLM",
+  "Upstream API",
   "Engine Context",
   "Ranking",
   "Auto Analysis",
@@ -75,9 +77,27 @@ const CATEGORY_ORDER = [
 
 type WikiVariableCategory = (typeof CATEGORY_ORDER)[number];
 
-const EXPECTED_RUNTIME_WIKI_ENV_VARS = 71;
+const EXPECTED_RUNTIME_WIKI_ENV_VARS = 79;
+
+const SENSITIVE_ENV_NAME_RE = /(API_KEY|TOKEN|SECRET|PASSWORD)/i;
+
+function isSensitiveVariableName(name: string): boolean {
+  return SENSITIVE_ENV_NAME_RE.test(name);
+}
+
+function displayValue(value: string, sensitive: boolean, reveal: boolean): string {
+  if (!value) return "(empty)";
+  if (!sensitive || reveal) return value;
+  return "********";
+}
 
 function categoryForVariable(name: string): WikiVariableCategory {
+  if (name.startsWith("UNSLOTH_LLM_UPSTREAM_")) {
+    return "Upstream API";
+  }
+  if (name.startsWith("UNSLOTH_WIKI_LLM_")) {
+    return "Wiki LLM";
+  }
   if (
     name.includes("ENGINE_ENRICH_WEB") ||
     name.includes("ENGINE_ENRICH_FILL") ||
@@ -150,6 +170,7 @@ export function WikiBehaviourDialog({
   const [variables, setVariables] = useState<WikiEnvVariable[]>([]);
   const [draftValues, setDraftValues] = useState<Record<string, string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [revealedSensitive, setRevealedSensitive] = useState<Record<string, boolean>>({});
   const [restartSupported, setRestartSupported] = useState(false);
   const [overridesFile, setOverridesFile] = useState("");
   const [sectionOpen, setSectionOpen] = useState<Record<WikiVariableCategory, boolean>>(
@@ -207,6 +228,7 @@ export function WikiBehaviourDialog({
   useEffect(() => {
     if (!open) return;
     setQuery("");
+    setRevealedSensitive({});
     void loadConfig();
   }, [open]);
 
@@ -409,6 +431,8 @@ export function WikiBehaviourDialog({
                           const value = draftValues[item.name] ?? item.current_value;
                           const isChanged = value !== item.current_value;
                           const error = fieldErrors[item.name];
+                          const sensitive = isSensitiveVariableName(item.name);
+                          const revealSensitive = Boolean(revealedSensitive[item.name]);
                           return (
                             <div
                               key={item.name}
@@ -448,6 +472,8 @@ export function WikiBehaviourDialog({
                                   </select>
                                 ) : (
                                   <Input
+                                    type={sensitive && !revealSensitive ? "password" : "text"}
+                                    autoComplete={sensitive ? "new-password" : "off"}
                                     value={value}
                                     onChange={(event) => setDraftValue(item.name, event.target.value)}
                                     disabled={saving}
@@ -467,6 +493,22 @@ export function WikiBehaviourDialog({
                                 >
                                   Default
                                 </Button>
+                                {sensitive ? (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="xs"
+                                    disabled={saving}
+                                    onClick={() =>
+                                      setRevealedSensitive((current) => ({
+                                        ...current,
+                                        [item.name]: !revealSensitive,
+                                      }))
+                                    }
+                                  >
+                                    {revealSensitive ? "Hide" : "Show"}
+                                  </Button>
+                                ) : null}
                                 <Button
                                   type="button"
                                   variant="ghost"
@@ -479,9 +521,13 @@ export function WikiBehaviourDialog({
                               </div>
 
                               <div className="pt-2 text-xs text-muted-foreground">
-                                <span>Current: {currentValues[item.name] ?? item.current_value}</span>
+                                <span>
+                                  Current: {displayValue(currentValues[item.name] ?? item.current_value, sensitive, revealSensitive)}
+                                </span>
                                 <span className="px-2">•</span>
-                                <span>Default: {item.default_value}</span>
+                                <span>
+                                  Default: {displayValue(item.default_value, sensitive, revealSensitive)}
+                                </span>
                                 {item.minimum !== null && item.minimum !== undefined ? (
                                   <>
                                     <span className="px-2">•</span>

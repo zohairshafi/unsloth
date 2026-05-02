@@ -118,10 +118,17 @@ class WikiManager:
 
         top_pages = ranked if pages_limit <= 0 else ranked[:pages_limit]
         blocks: List[Dict] = []
+        context_pages: List[str] = []
         for rel_path, score in top_pages:
-            page_text = (self.engine.wiki_dir / rel_path).read_text(
-                encoding = "utf-8", errors = "ignore"
-            )
+            try:
+                page_text = (self.engine.wiki_dir / rel_path).read_text(
+                    encoding = "utf-8",
+                    errors = "ignore",
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
             blocks.append(
                 {
                     "page": rel_path,
@@ -131,12 +138,13 @@ class WikiManager:
                     else page_text[:chars_limit],
                 }
             )
+            context_pages.append(rel_path)
 
         return {
             "status": "ok",
             "question": question,
             "ranking_mode": ranking_mode,
-            "context_pages": [page for page, _ in top_pages],
+            "context_pages": context_pages,
             "context_blocks": blocks,
         }
 

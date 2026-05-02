@@ -79,7 +79,6 @@ import { toast } from "sonner";
 import { ShutdownDialog } from "@/components/shutdown-dialog";
 import { WikiBehaviourDialog } from "@/components/wiki-behaviour-dialog";
 import { WikiDataDialog } from "@/components/wiki-data-dialog";
-import { toast } from "sonner";
 
 type WikiLintApiResponse = {
   status: string;
@@ -205,6 +204,18 @@ type WikiRetryFallbackResult = {
 type WikiEnrichResult = {
   scanned_pages?: number;
   updated_pages?: number;
+  web_gap_fill?: {
+    enabled?: boolean;
+    lint_missing_concepts?: number;
+    concepts_considered?: number;
+    queries_used?: number;
+    concepts_created?: number;
+    llm_web_planner_ok_concepts?: number;
+    llm_web_selector_ok_concepts?: number;
+    llm_web_direct_results_used?: number;
+    failed_concepts?: unknown[];
+    web_discovery_audit?: unknown[];
+  };
   non_fallback_refresh?: {
     enabled?: boolean;
     requested_pages?: number;
@@ -421,6 +432,7 @@ export function AppSidebar() {
           max_analysis_pages: 256,
           run_fallback_retry_first: false,
           fill_gaps_from_web: fillGapsFromWeb,
+          ...(fillGapsFromWeb ? { max_web_gap_queries: 8 } : {}),
         }),
       });
       if (!enrichResponse.ok) {
@@ -445,6 +457,29 @@ export function AppSidebar() {
 
       const enrichScanned = Number(enrichResult.scanned_pages ?? 0);
       const enrichUpdated = Number(enrichResult.updated_pages ?? 0);
+
+      const webGapFillResult = enrichResult.web_gap_fill;
+      const webGapEnabled = Boolean(webGapFillResult?.enabled);
+      const webLintMissingConcepts = Number(webGapFillResult?.lint_missing_concepts ?? 0);
+      const webConceptsConsidered = Number(webGapFillResult?.concepts_considered ?? 0);
+      const webQueriesUsed = Number(webGapFillResult?.queries_used ?? 0);
+      const webConceptsCreated = Number(webGapFillResult?.concepts_created ?? 0);
+      const webPlannerOkConcepts = Number(
+        webGapFillResult?.llm_web_planner_ok_concepts ?? 0,
+      );
+      const webSelectorOkConcepts = Number(
+        webGapFillResult?.llm_web_selector_ok_concepts ?? 0,
+      );
+      const webDirectResultsUsed = Number(
+        webGapFillResult?.llm_web_direct_results_used ?? 0,
+      );
+      const webFailedConcepts = Array.isArray(webGapFillResult?.failed_concepts)
+        ? webGapFillResult.failed_concepts.length
+        : 0;
+      const webAuditEntries = Array.isArray(webGapFillResult?.web_discovery_audit)
+        ? webGapFillResult.web_discovery_audit.length
+        : 0;
+
       const refreshResult = enrichResult.non_fallback_refresh;
       const refreshEnabled = Boolean(refreshResult?.enabled);
       const refreshRequested = Number(refreshResult?.requested_pages ?? 0);
@@ -479,6 +514,9 @@ export function AppSidebar() {
           : repairAnswerLinksEnabled
             ? " Answer-section link repair mode was enabled."
             : "";
+      const webFillSummary = fillGapsFromWeb
+        ? ` Web fill ${webGapEnabled ? "enabled" : "disabled"}: lint gaps: ${webLintMissingConcepts}, considered: ${webConceptsConsidered}, queries used: ${webQueriesUsed}, concepts created: ${webConceptsCreated}, planner ok: ${webPlannerOkConcepts}, selector ok: ${webSelectorOkConcepts}, direct results: ${webDirectResultsUsed}, failed concepts: ${webFailedConcepts}, audit entries: ${webAuditEntries}.`
+        : "";
 
       const maintenanceTitle = fillGapsFromWeb
         ? "Wiki maintenance (with web fill) completed"
@@ -488,7 +526,7 @@ export function AppSidebar() {
         description:
           `Fallbacks found: ${fallbackFound}, regenerated: ${fallbackRegenerated}, still fallback: ${fallbackStill}. ` +
           `Applied merges: ${appliedMerges}, rewritten links: ${rewrittenLinks}, archived pages: ${archived}. ` +
-          `Enriched pages: ${enrichUpdated}/${enrichScanned}.${refreshSummary}${repairSummary} Errors: ${totalErrors}`,
+          `Enriched pages: ${enrichUpdated}/${enrichScanned}.${webFillSummary}${refreshSummary}${repairSummary} Errors: ${totalErrors}`,
       });
       closeMobileIfOpen();
     } catch (error) {
@@ -661,26 +699,6 @@ export function AppSidebar() {
                   if (chatOnly) return;
                   navigate({ to: "/export" });
                   closeMobileIfOpen();
-                }}
-              />
-
-              <NavItem
-                icon={Search01Icon}
-                label={wikiLintRunning ? "Linting..." : "Lint"}
-                active={wikiLintRunning}
-                disabled={wikiLintRunning}
-                onClick={() => {
-                  void runWikiLint();
-                }}
-              />
-
-              <NavItem
-                icon={ZapIcon}
-                label={wikiMaintenanceRunning ? "Maintaining..." : "Maintenance"}
-                active={wikiMaintenanceRunning}
-                disabled={wikiMaintenanceRunning}
-                onClick={() => {
-                  void runWikiMaintenance();
                 }}
               />
             </SidebarMenu>

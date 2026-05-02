@@ -514,6 +514,57 @@ def test_engine_surfaces_extraction_diagnostics(tmp_path: Path):
     assert "John Doe" in text
 
 
+def test_extract_from_source_salvages_truncated_json_output(tmp_path: Path):
+    truncated_json = (
+        '{"summary":"Graph-SCP summary","entities":[{"name":"Graph-SCP","summary":"Method","facts":["Reduces SCP size"],"contradictions":[]}],'
+        '"concepts":[{"name":"Set Cover Problem","summary":"Optimization objective","facts":["NP-hard"],"contradictions":[]}'
+    )
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = lambda _prompt: truncated_json,
+    )
+
+    extracted = engine._extract_from_source(
+        title = "Graph-SCP Paper",
+        text = "Graph-SCP is a GNN-based approach for SCP acceleration.",
+    )
+
+    assert extracted["_meta"]["status"] == "ok"
+    assert extracted["_meta"]["reason"] == "llm_json_repaired"
+    assert extracted["summary"] == "Graph-SCP summary"
+    assert extracted["entities"][0]["name"] == "Graph-SCP"
+    assert extracted["concepts"][0]["name"] == "Set Cover Problem"
+
+
+def test_extract_from_source_salvages_truncated_repair_output(tmp_path: Path):
+    truncated_repair_json = (
+        '{"summary":"Recovered summary","entities":[{"name":"Graph-SCP","summary":"Method","facts":[],"contradictions":[]}],'
+        '"concepts":[{"name":"Set Cover Problem","summary":"Optimization objective","facts":[],"contradictions":[]}'
+    )
+
+    def _llm(prompt: str) -> str:
+        if "JSON repair assistant" in prompt:
+            return truncated_repair_json
+        return "not-json"
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = _llm,
+    )
+
+    extracted = engine._extract_from_source(
+        title = "Graph-SCP Paper",
+        text = "Graph-SCP is a GNN-based approach for SCP acceleration.",
+    )
+
+    assert extracted["_meta"]["status"] == "ok"
+    assert extracted["_meta"]["reason"] == "llm_json_repaired"
+    assert extracted["summary"] == "Recovered summary"
+    assert extracted["entities"][0]["name"] == "Graph-SCP"
+    assert extracted["concepts"][0]["name"] == "Set Cover Problem"
+
+
 def test_ingest_source_sanitizes_invalid_unicode_surrogates(tmp_path: Path):
     engine = LLMWikiEngine(
         cfg = WikiConfig(vault_root = tmp_path),
@@ -3264,6 +3315,69 @@ def test_retry_fallback_prefers_primary_source_link_from_question(
     assert report["regenerated_pages"] == 1
     assert call_history
     assert call_history[0]["preferred_context_page"] == "sources/alpha"
+    assert "Output format:" in call_history[0]["question"]
+    assert "Section I:" in call_history[0]["question"]
+
+
+def test_retry_fallback_source_first_does_not_overwrite_if_sections_still_missing(
+    tmp_path: Path,
+    monkeypatch,
+):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = lambda _: "{}",
+    )
+
+    (tmp_path / "wiki" / "sources" / "alpha.md").write_text(
+        "# Alpha\n\nalpha source body\n",
+        encoding = "utf-8",
+    )
+
+    fallback_page = tmp_path / "wiki" / "analysis" / "fallback-source-first-missing.md"
+    fallback_page.write_text(
+        "# Query Result\n\n"
+        "## Question\n"
+        "Summarize source 'Alpha' with a source-first lens. Primary page: [[sources/alpha]].\n\n"
+        "## Answer Mode\nextractive-fallback\n\n"
+        "## Answer\nFallback answer\n\n"
+        "## Fallback Reason\nrepetition\n\n"
+        "## Context Pages\n- [[sources/alpha]]\n",
+        encoding = "utf-8",
+    )
+
+    original_text = fallback_page.read_text(encoding = "utf-8")
+
+    def _fake_query(
+        question: str,
+        save_answer: bool = True,
+        query_context_max_chars_override = None,
+        preferred_context_page = None,
+        keep_preferred_context_full: bool = False,
+        preferred_context_only: bool = False,
+    ):
+        return {
+            "used_extractive_fallback": False,
+            "answer": (
+                "Title: Alpha Summary\n"
+                "Section A: Overview tied to [[sources/alpha]].\n"
+                "Section B: - Takeaway one.\n"
+            ),
+            "context_pages": ["sources/alpha.md"],
+            "query_context_max_chars": query_context_max_chars_override,
+        }
+
+    monkeypatch.setattr(engine, "query", _fake_query)
+
+    report = engine.retry_fallback_analysis_pages(dry_run = False, max_analysis_pages = 20)
+
+    assert report["fallback_pages_found"] == 1
+    assert report["regenerated_pages"] == 0
+    assert report["fallback_still"] == 1
+    assert report["results"][0]["status"] == "fallback_still"
+
+    # Preserve original page content when regenerated answer still fails
+    # source-first section completeness checks.
+    assert fallback_page.read_text(encoding = "utf-8") == original_text
 
 
 def test_index_flags_fallback_analysis_pages(tmp_path: Path):
@@ -3412,6 +3526,46 @@ def test_index_flags_source_first_llm_with_missing_sections_as_fallback(
 
     report = engine.retry_fallback_analysis_pages(dry_run = True, max_analysis_pages = 10)
     assert report["fallback_pages_found"] == 1
+
+
+def test_index_flags_resolved_source_first_page_if_sections_still_missing(
+    tmp_path: Path,
+):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = lambda _: "{}",
+    )
+
+    analysis_path = tmp_path / "wiki" / "analysis" / "source-first-resolved-missing.md"
+    analysis_path.write_text(
+        "# Query Result\n\n"
+        "## Question\n"
+        "Summarize source 'Alpha Source' with a source-first lens. "
+        "Primary page: [[sources/alpha-source]].\n\n"
+        "## Answer Mode\nllm\n\n"
+        "## Answer\n"
+        "Title: Alpha Source Summary\n"
+        "Section A: A brief summary tied to [[sources/alpha-source]].\n"
+        "Section B: - Takeaway one.\n\n"
+        "## Retry Status\n"
+        "- status: resolved_in_place\n"
+        "- resolved_by: [[analysis/source-first-resolved-missing]]\n"
+        "- resolved_at: 2026-04-29T00:00:00+00:00\n",
+        encoding = "utf-8",
+    )
+
+    page_text = analysis_path.read_text(encoding = "utf-8")
+    assert engine._analysis_page_uses_fallback(page_text) is True
+
+    engine._rebuild_index()
+    index_text = (tmp_path / "wiki" / "index.md").read_text(encoding = "utf-8")
+    line = next(
+        item
+        for item in index_text.splitlines()
+        if "[[analysis/source-first-resolved-missing]]" in item
+    )
+    assert "[fallback: missing_watcher_sections:" in line
+    assert "[fallback-resolved:" not in line
 
 
 def test_source_first_llm_heading_sections_with_sectino_typo_not_flagged_fallback(
@@ -3599,7 +3753,7 @@ def test_index_analysis_summary_ignores_template_placeholder_title(tmp_path: Pat
     assert "Section A: Brief summary paragraph" not in line
     assert "FORGE Framework" in line
     assert "[[sources/2508-20330v4]]" in line
-    assert "[fallback-resolved:" in line
+    assert "[fallback: missing_watcher_sections:" in line
 
 
 def test_index_analysis_summary_replaces_identifier_source_title_with_source_page_title(
@@ -3655,7 +3809,7 @@ def test_index_analysis_summary_replaces_identifier_source_title_with_source_pag
         "FORGE: Foundational Optimization with Representation Graph Engineering" in line
     )
     assert "[[sources/2508-20330v4]]" in line
-    assert "[fallback-resolved:" in line
+    assert "[fallback: missing_watcher_sections:" in line
 
 
 def test_index_analysis_summary_replaces_generic_chat_history_title_with_source_summary(

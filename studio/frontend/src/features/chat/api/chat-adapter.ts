@@ -14,7 +14,10 @@ import {
   validateModel,
 } from "./chat-api";
 import { db } from "../db";
-import { useChatRuntimeStore } from "../stores/chat-runtime-store";
+import {
+  resolveReasoningStyle,
+  useChatRuntimeStore,
+} from "../stores/chat-runtime-store";
 import type { ChatModelSummary } from "../types/runtime";
 import {
   hasClosedThinkTag,
@@ -428,13 +431,22 @@ async function autoLoadSmallestModel(): Promise<{
             if (!existingModels.some((m) => m.id === repo.repo_id)) {
               store.setModels([...existingModels, autoModel]);
             }
+            const supportsReasoning = loadResp.supports_reasoning ?? false;
+            const reasoningAlwaysOn = loadResp.reasoning_always_on ?? false;
+            const currentReasoningStyle = useChatRuntimeStore.getState().reasoningStyle;
+            const reasoningStyle = resolveReasoningStyle(
+              supportsReasoning,
+              reasoningAlwaysOn,
+              loadResp.reasoning_style,
+              currentReasoningStyle,
+            );
             useChatRuntimeStore.setState({
               ggufContextLength: loadResp.context_length ?? 131072,
               ggufMaxContextLength: loadResp.max_context_length ?? loadResp.context_length ?? 131072,
-              supportsReasoning: loadResp.supports_reasoning ?? false,
-              reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
-              reasoningEnabled: loadResp.supports_reasoning ?? false,
-              reasoningStyle: loadResp.reasoning_style ?? "enable_thinking",
+              supportsReasoning,
+              reasoningAlwaysOn,
+              reasoningEnabled: supportsReasoning,
+              reasoningStyle,
               supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
               supportsTools: loadResp.supports_tools ?? false,
               toolsEnabled: loadResp.supports_tools ?? false,
@@ -484,11 +496,20 @@ async function autoLoadSmallestModel(): Promise<{
             sfLoadResp.requires_trust_remote_code ?? false,
           );
           store.setParams({ ...store.params, maxTokens: 4096 });
+          const supportsReasoning = sfLoadResp.supports_reasoning ?? false;
+          const reasoningAlwaysOn = sfLoadResp.reasoning_always_on ?? false;
+          const currentReasoningStyle = useChatRuntimeStore.getState().reasoningStyle;
+          const reasoningStyle = resolveReasoningStyle(
+            supportsReasoning,
+            reasoningAlwaysOn,
+            sfLoadResp.reasoning_style,
+            currentReasoningStyle,
+          );
           useChatRuntimeStore.setState({
-            supportsReasoning: sfLoadResp.supports_reasoning ?? false,
-            reasoningAlwaysOn: sfLoadResp.reasoning_always_on ?? false,
-            reasoningEnabled: sfLoadResp.supports_reasoning ?? false,
-            reasoningStyle: sfLoadResp.reasoning_style ?? "enable_thinking",
+            supportsReasoning,
+            reasoningAlwaysOn,
+            reasoningEnabled: supportsReasoning,
+            reasoningStyle,
             supportsPreserveThinking: sfLoadResp.supports_preserve_thinking ?? false,
             supportsTools: sfLoadResp.supports_tools ?? false,
           });
@@ -554,13 +575,22 @@ async function autoLoadSmallestModel(): Promise<{
       if (!store.models.some((m) => m.id === "unsloth/gemma-4-E2B-it-GGUF")) {
         store.setModels([...store.models, defaultModel]);
       }
+      const supportsReasoning = loadResp.supports_reasoning ?? false;
+      const reasoningAlwaysOn = loadResp.reasoning_always_on ?? false;
+      const currentReasoningStyle = useChatRuntimeStore.getState().reasoningStyle;
+      const reasoningStyle = resolveReasoningStyle(
+        supportsReasoning,
+        reasoningAlwaysOn,
+        loadResp.reasoning_style,
+        currentReasoningStyle,
+      );
       useChatRuntimeStore.setState({
         ggufContextLength: loadResp.context_length ?? 131072,
         ggufMaxContextLength: loadResp.max_context_length ?? loadResp.context_length ?? 131072,
-        supportsReasoning: loadResp.supports_reasoning ?? false,
-        reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
-        reasoningEnabled: loadResp.supports_reasoning ?? false,
-        reasoningStyle: loadResp.reasoning_style ?? "enable_thinking",
+        supportsReasoning,
+        reasoningAlwaysOn,
+        reasoningEnabled: supportsReasoning,
+        reasoningStyle,
         supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
         supportsTools: loadResp.supports_tools ?? false,
         toolsEnabled: loadResp.supports_tools ?? false,
@@ -640,7 +670,6 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       const reasoningCapable = runtime.supportsReasoning || useUpstream;
       const toolCapable = supportsTools || useUpstream;
       const reasoningEnabled = runtime.reasoningEnabled;
-      const reasoningEffortHigh = runtime.reasoningEffortHigh;
 
       const outboundMessages = messages
         .map(toOpenAIMessage)
@@ -793,13 +822,13 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                 }
               : {}),
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
-            ...(supportsReasoning
+            ...(reasoningCapable
               ? reasoningStyle === "reasoning_effort"
                 ? { reasoning_effort: reasoningEffort }
                 : { enable_thinking: reasoningEnabled }
               : {}),
             ...(supportsPreserveThinking ? { preserve_thinking: preserveThinking } : {}),
-            ...(supportsTools && (toolsEnabled || codeToolsEnabled)
+            ...(toolCapable && (toolsEnabled || codeToolsEnabled)
               ? {
                   enable_tools: true,
                   enabled_tools: [

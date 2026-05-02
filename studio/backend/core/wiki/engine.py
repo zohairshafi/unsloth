@@ -2302,6 +2302,11 @@ class LLMWikiEngine:
             preferred_source_page, source_chars = self._analysis_primary_source_context(
                 text
             )
+            retry_question = self._retry_question_for_analysis(
+                analysis_text = text,
+                question = question,
+                preferred_source_page = preferred_source_page,
+            )
             attempt_override = self._retry_initial_context_override(source_chars)
             source_only_mode = self.cfg.analysis_source_only
             if source_only_mode and source_chars is not None:
@@ -2318,7 +2323,7 @@ class LLMWikiEngine:
                 probe_result = None
                 while True:
                     probe_result = self.query(
-                        question,
+                        retry_question,
                         save_answer = False,
                         query_context_max_chars_override = attempt_override,
                         preferred_context_page = preferred_source_page,
@@ -2441,7 +2446,7 @@ class LLMWikiEngine:
                                     )
 
                                 probe_result = self.query(
-                                    question,
+                                    retry_question,
                                     save_answer = False,
                                     query_context_max_chars_override = retry_override,
                                     preferred_context_page = retry_source_page,
@@ -2573,13 +2578,6 @@ class LLMWikiEngine:
                         "Retry Status",
                     )
 
-                    # Keep resolved marker so already-handled pages are not retried again.
-                    updated_text = self._upsert_retry_status_section(
-                        text = updated_text,
-                        resolved_by = resolved_page,
-                        status = "resolved_in_place",
-                    )
-
                     if self._analysis_page_uses_fallback(updated_text):
                         fallback_still += 1
                         status_value = "fallback_still"
@@ -2588,6 +2586,13 @@ class LLMWikiEngine:
                             or fallback_reason
                         )
                     else:
+                        # Only mark as resolved after the regenerated page no longer
+                        # matches fallback criteria.
+                        updated_text = self._upsert_retry_status_section(
+                            text = updated_text,
+                            resolved_by = resolved_page,
+                            status = "resolved_in_place",
+                        )
                         page_path.write_text(updated_text, encoding = "utf-8")
                         regenerated_pages += 1
                         new_answer_page = resolved_page
@@ -4356,12 +4361,22 @@ class LLMWikiEngine:
         )
         raw = self.llm_fn(prompt)
         raw_text = str(raw or "").strip()
-        parsed = self._safe_json(raw)
+        parsed = self._safe_json(raw_text)
+        parsed_required_salvage = False
+        if parsed is None:
+            parsed = self._salvage_extraction_json(raw_text)
+            parsed_required_salvage = parsed is not None
 
         meta: Dict[str, Any] = {
             "status": "ok",
             "reason": "llm_json_ok",
         }
+
+        if parsed is not None and parsed_required_salvage:
+            meta = {
+                "status": "ok",
+                "reason": "llm_json_repaired",
+            }
 
         if parsed is None:
             failure_reason = "llm_json_parse_failed"
@@ -4434,7 +4449,119 @@ class LLMWikiEngine:
             f"SOURCE_HINT:\n{source_text[:1200]}"
         )
         repaired_raw = self.llm_fn(repair_prompt)
-        return self._safe_json(str(repaired_raw or "").strip())
+        repaired_text = str(repaired_raw or "").strip()
+        parsed = self._safe_json(repaired_text)
+        if parsed is not None:
+            return parsed
+        return self._salvage_extraction_json(repaired_text)
+
+    def _salvage_extraction_json(self, model_output: str) -> Optional[Dict[str, Any]]:
+        raw = str(model_output or "").strip()
+        if not raw:
+            return None
+
+        candidate = raw
+        fence_open = re.match(r"^```(?:json)?\s*", candidate, flags = re.IGNORECASE)
+        if fence_open:
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags = re.IGNORECASE)
+            candidate = candidate.rstrip()
+            if candidate.endswith("```"):
+                candidate = candidate[:-3].rstrip()
+
+        start = candidate.find("{")
+        if start < 0:
+            return None
+
+        candidate = candidate[start:].rstrip()
+        if not candidate:
+            return None
+
+        max_trim = min(240, max(0, len(candidate) - 2))
+        for trim in range(max_trim + 1):
+            working = candidate[:-trim].rstrip() if trim else candidate
+            if len(working) < 2:
+                break
+
+            repaired = self._auto_close_json_object_candidate(working)
+            if not repaired:
+                continue
+
+            try:
+                parsed = json.loads(repaired)
+            except Exception:
+                continue
+
+            if not isinstance(parsed, dict):
+                continue
+
+            if any(key in parsed for key in ("summary", "entities", "concepts")):
+                return parsed
+
+        return None
+
+    def _auto_close_json_object_candidate(self, candidate: str) -> Optional[str]:
+        start = candidate.find("{")
+        if start < 0:
+            return None
+
+        text = candidate[start:]
+        out: list[str] = []
+        stack: list[str] = []
+        in_string = False
+        escape = False
+
+        for ch in text:
+            if in_string:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+                continue
+
+            if ch in "[{":
+                stack.append(ch)
+                out.append(ch)
+                continue
+
+            if ch == "}":
+                if stack and stack[-1] == "{":
+                    stack.pop()
+                    out.append(ch)
+                continue
+
+            if ch == "]":
+                if stack and stack[-1] == "[":
+                    stack.pop()
+                    out.append(ch)
+                continue
+
+            out.append(ch)
+
+        repaired = "".join(out).rstrip()
+        if not repaired.startswith("{"):
+            return None
+
+        if repaired.endswith("\\"):
+            repaired = repaired[:-1].rstrip()
+
+        if in_string:
+            repaired += '"'
+
+        repaired = re.sub(r",\s*$", "", repaired)
+
+        if stack:
+            repaired += "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+
+        repaired = re.sub(r",\s*([\]}])", r"\1", repaired)
+        return repaired
 
     def _looks_garbled(self, text: str) -> bool:
         if not text:
@@ -5724,7 +5851,21 @@ class LLMWikiEngine:
                 out.append("- (none)")
             for f in files:
                 rel = f"{subdir}/{f.stem}"
-                page_text = f.read_text(encoding = "utf-8", errors = "ignore")
+                try:
+                    page_text = f.read_text(encoding = "utf-8", errors = "ignore")
+                except FileNotFoundError:
+                    logger.debug(
+                        "Skipping wiki page that disappeared during index rebuild: %s",
+                        f,
+                    )
+                    continue
+                except OSError as exc:
+                    logger.warning(
+                        "Skipping unreadable wiki page during index rebuild (%s): %s",
+                        f,
+                        exc,
+                    )
+                    continue
                 if subdir == "analysis":
                     summary = self._analysis_index_summary(page_text)
                     line = f"- [[{rel}]] - {summary}".rstrip()
@@ -5743,16 +5884,16 @@ class LLMWikiEngine:
             f.write("\n" + entry.strip() + "\n")
 
     def _analysis_page_uses_fallback(self, text: str) -> bool:
-        if self._extract_analysis_resolved_by(text):
-            return False
-
         lowered = text.lower()
+        resolved_by = self._extract_analysis_resolved_by(text)
         explicit_fallback = (
             "## answer mode\nextractive-fallback" in lowered
             or "## fallback reason" in lowered
         )
         if explicit_fallback:
-            return True
+            # Pages explicitly marked as superseded/resolved can keep legacy
+            # fallback sections but should not be retried again.
+            return not bool(resolved_by)
 
         return self._analysis_missing_watcher_sections_reason(text) is not None
 
@@ -5927,6 +6068,68 @@ class LLMWikiEngine:
             return source_link, None
 
         return source_link, source_chars
+
+    def _retry_question_for_analysis(
+        self,
+        *,
+        analysis_text: str,
+        question: str,
+        preferred_source_page: Optional[str],
+    ) -> str:
+        raw_question = str(question or "").strip()
+        if not raw_question:
+            return ""
+
+        # Source-first pages are persisted with compact questions; rebuild the
+        # full source-first prompt so retries preserve sectioned answer format.
+        if not self._question_is_source_first_summary(raw_question):
+            return raw_question
+
+        normalized_source_page = self._normalize_wikilink(preferred_source_page or "")
+        if not normalized_source_page:
+            normalized_source_page = (
+                self._extract_primary_source_link_from_question(raw_question) or ""
+            )
+        if not normalized_source_page:
+            normalized_source_page = (
+                self._extract_analysis_primary_source_link(analysis_text) or ""
+            )
+
+        if normalized_source_page and not normalized_source_page.startswith("sources/"):
+            normalized_source_page = f"sources/{self._slug(normalized_source_page)}"
+
+        title_match = re.search(r"(?i)summarize\s+source\s+'([^']+)'", raw_question)
+        source_title = title_match.group(1).strip() if title_match else ""
+
+        source_page_text = ""
+        if normalized_source_page:
+            source_path = self.wiki_dir / f"{normalized_source_page}.md"
+            if source_path.exists():
+                try:
+                    source_page_text = source_path.read_text(
+                        encoding = "utf-8",
+                        errors = "ignore",
+                    )
+                except OSError:
+                    source_page_text = ""
+
+        if normalized_source_page and source_page_text:
+            source_title = self._extract_source_page_title_for_retry(
+                source_page = normalized_source_page,
+                source_text = source_page_text,
+            )
+
+        if not source_title:
+            if normalized_source_page:
+                source_slug = normalized_source_page.split("/", 1)[-1]
+                source_title = (
+                    source_slug.replace("-", " ").replace("_", " ").strip()
+                )
+            if not source_title:
+                source_title = "source"
+
+        source_page = normalized_source_page or f"sources/{self._slug(source_title)}"
+        return self._source_first_summary_question(source_title, source_page)
 
     def _extract_source_page_title_for_retry(
         self,
@@ -6301,15 +6504,16 @@ class LLMWikiEngine:
         return self._analysis_missing_watcher_sections_reason(text)
 
     def _analysis_index_fallback_tag(self, text: str) -> str:
+        if self._analysis_page_uses_fallback(text):
+            reason = self._extract_analysis_fallback_reason(text)
+            if reason:
+                return f"[fallback: {reason}]"
+            return "[fallback]"
+
         resolved_by = self._extract_analysis_resolved_by(text)
         if resolved_by:
             return f"[fallback-resolved: {resolved_by}]"
-        if not self._analysis_page_uses_fallback(text):
-            return ""
-        reason = self._extract_analysis_fallback_reason(text)
-        if reason:
-            return f"[fallback: {reason}]"
-        return "[fallback]"
+        return ""
 
     def _upsert_retry_status_section(
         self,
@@ -7557,7 +7761,24 @@ class LLMWikiEngine:
             if rel in {"index.md", "log.md"}:
                 continue
 
-            text = (self.wiki_dir / rel).read_text(encoding = "utf-8", errors = "ignore")
+            try:
+                text = (self.wiki_dir / rel).read_text(
+                    encoding = "utf-8",
+                    errors = "ignore",
+                )
+            except FileNotFoundError:
+                logger.debug(
+                    "Skipping wiki page that disappeared during ranking: %s",
+                    rel,
+                )
+                continue
+            except OSError as exc:
+                logger.warning(
+                    "Skipping unreadable wiki page during ranking (%s): %s",
+                    rel,
+                    exc,
+                )
+                continue
             text_for_ranking = (
                 text
                 if self.cfg.ranking_max_chars <= 0
