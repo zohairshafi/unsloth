@@ -162,6 +162,12 @@ function collectTextParts(message: RunMessage): string[] {
   return textParts;
 }
 
+function collectReasoningParts(message: RunMessage): string[] {
+  return message.content
+    .filter((part) => part.type === "reasoning")
+    .map((part) => part.text);
+}
+
 function hasMediaPart(
   message: RunMessage,
   mediaType: "image" | "audio",
@@ -191,9 +197,13 @@ function hasMediaPart(
   return false;
 }
 
-function toOpenAIMessage(message: RunMessage): {
+function toOpenAIMessage(
+  message: RunMessage,
+  options?: { includeReasoningContent?: boolean },
+): {
   role: "system" | "user" | "assistant";
   content: string;
+  reasoning_content?: string;
 } | null {
   if (
     message.role !== "system" &&
@@ -233,7 +243,22 @@ function toOpenAIMessage(message: RunMessage): {
     );
   }
 
-  return { role: message.role, content };
+  const out: {
+    role: "system" | "user" | "assistant";
+    content: string;
+    reasoning_content?: string;
+  } = { role: message.role, content };
+
+  // DeepSeek-style upstream APIs can consume assistant reasoning traces
+  // from prior turns when needed (notably tool-call continuity).
+  if (message.role === "assistant" && options?.includeReasoningContent) {
+    const reasoning = collectReasoningParts(message).join("\n").trim();
+    if (reasoning) {
+      out.reasoning_content = reasoning;
+    }
+  }
+
+  return out;
 }
 
 function extractImageBase64(input: string): string | undefined {
@@ -672,7 +697,9 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       const reasoningEnabled = runtime.reasoningEnabled;
 
       const outboundMessages = messages
-        .map(toOpenAIMessage)
+        .map((message) =>
+          toOpenAIMessage(message, { includeReasoningContent: useUpstream })
+        )
         .filter((message): message is NonNullable<typeof message> =>
           Boolean(message),
         );
@@ -787,6 +814,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       let cumulativeText = "";
       let reasoningStartAt: number | null = null;
       let reasoningDuration = 0;
+      let reasoningTagOpen = false;
       // Tool call content parts — accumulated and yielded cumulatively.
       // result is set directly on the tool-call part when tool_end arrives.
       const toolCallParts: ToolCallMessagePart[] = [];
@@ -919,8 +947,9 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
           }
 
           totalChunks += 1;
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (!delta) {
+          const deltaContent = chunk.choices?.[0]?.delta?.content ?? "";
+          const deltaReasoning = chunk.choices?.[0]?.delta?.reasoning_content ?? "";
+          if (!deltaContent && !deltaReasoning) {
             continue;
           }
           if (waitingFirstChunk) {
@@ -930,7 +959,21 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             runtime.setGeneratingStatus(null);
           }
 
-          cumulativeText += delta;
+          if (deltaReasoning) {
+            if (!reasoningTagOpen) {
+              cumulativeText += "<think>";
+              reasoningTagOpen = true;
+            }
+            cumulativeText += deltaReasoning;
+          }
+          if (deltaContent) {
+            if (reasoningTagOpen) {
+              cumulativeText += "</think>";
+              reasoningTagOpen = false;
+            }
+            cumulativeText += deltaContent;
+          }
+
           const parts = parseAssistantContent(cumulativeText);
 
           if (parts.some((part) => part.type === "reasoning") && !reasoningStartAt) {
@@ -952,6 +995,14 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                 custom: { reasoningDuration },
               },
             };
+          }
+        }
+
+        if (reasoningTagOpen) {
+          cumulativeText += "</think>";
+          reasoningTagOpen = false;
+          if (reasoningStartAt && !reasoningDuration) {
+            reasoningDuration = Math.round((Date.now() - reasoningStartAt) / 1000);
           }
         }
         settleFirstTokenOk();

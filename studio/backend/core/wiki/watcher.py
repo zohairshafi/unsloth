@@ -167,8 +167,25 @@ class WikiFileEventHandler(FileSystemEventHandler):
                     return
                 self._ingest_inflight.add(resolved)
 
+            trace_id: Optional[str] = None
             try:
-                logger.info(f"New file detected in wiki raw directory: {file_path}")
+                # Keep background wiki LLM telemetry grouped per file event
+                # so call_seq starts at 1 for each ingest/analysis workflow.
+                from routes.inference import _start_chat_trace
+
+                trace_id = _start_chat_trace()
+            except Exception:
+                trace_id = None
+
+            try:
+                if trace_id:
+                    logger.info(
+                        "New file detected in wiki raw directory: %s (trace_id=%s)",
+                        file_path,
+                        trace_id,
+                    )
+                else:
+                    logger.info(f"New file detected in wiki raw directory: {file_path}")
                 title = self.ingestor.ingest_file(
                     file_path, contributor = self.contributor
                 )
@@ -295,15 +312,41 @@ class WikiFileEventHandler(FileSystemEventHandler):
 
                     break
 
-                result = self.ingestor.wiki_manager.query_rag(
-                    question,
-                    query_context_max_chars_override = attempt_override,
-                    save_answer = True,
-                    preferred_context_page = source_page_rel,
-                    keep_preferred_context_full = True,
-                    preferred_context_only = source_only_mode,
+                result = probe_result if isinstance(probe_result, dict) else {}
+                answer_page = None
+                persisted_from_probe = False
+
+                persist_probe_fn = getattr(
+                    self.ingestor.wiki_manager,
+                    "persist_query_probe_result",
+                    None,
                 )
-                answer_page = result.get("answer_page")
+                if callable(persist_probe_fn):
+                    try:
+                        answer_page = persist_probe_fn(result, question = question)
+                    except Exception as exc:
+                        logger.warning(
+                            "Auto wiki analysis probe persistence failed for %s: %s",
+                            file_path.name,
+                            exc,
+                        )
+                        answer_page = None
+
+                if answer_page:
+                    persisted_from_probe = True
+                    result = dict(result)
+                    result["status"] = str(result.get("status", "ok") or "ok")
+                    result["answer_page"] = answer_page
+                else:
+                    result = self.ingestor.wiki_manager.query_rag(
+                        question,
+                        query_context_max_chars_override = attempt_override,
+                        save_answer = True,
+                        preferred_context_page = source_page_rel,
+                        keep_preferred_context_full = True,
+                        preferred_context_only = source_only_mode,
+                    )
+                    answer_page = result.get("answer_page")
 
                 with self._lock:
                     self._analysis_runs += 1
@@ -311,7 +354,8 @@ class WikiFileEventHandler(FileSystemEventHandler):
 
                 logger.info(
                     "Auto wiki analysis complete for %s (run=%d, answer_page=%s, "
-                    "context_chars_override=%s, source_only=%s, fallback=%s, reason=%s)",
+                    "context_chars_override=%s, source_only=%s, fallback=%s, reason=%s, "
+                    "persisted_from_probe=%s)",
                     file_path.name,
                     run_count,
                     answer_page,
@@ -319,6 +363,7 @@ class WikiFileEventHandler(FileSystemEventHandler):
                     source_only_mode,
                     result.get("used_extractive_fallback"),
                     result.get("fallback_reason"),
+                    persisted_from_probe,
                 )
 
                 if self.lint_every > 0 and run_count % self.lint_every == 0:

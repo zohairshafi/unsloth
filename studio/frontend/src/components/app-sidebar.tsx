@@ -201,6 +201,14 @@ type WikiRetryFallbackResult = {
   errors?: unknown[];
 };
 
+type WikiAnalysisBacklinksResult = {
+  scanned_analysis_pages?: number;
+  target_pages?: number;
+  linked_target_pages?: number;
+  updated_pages?: number;
+  removed_sections?: number;
+};
+
 type WikiEnrichResult = {
   scanned_pages?: number;
   updated_pages?: number;
@@ -441,9 +449,29 @@ export function AppSidebar() {
         );
       }
 
+      const backlinksResponse = await authFetch(
+        "/api/inference/wiki/analysis-backlinks",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dry_run: false,
+            max_analysis_pages: 256,
+            max_links_per_page: 128,
+          }),
+        },
+      );
+      if (!backlinksResponse.ok) {
+        throw new Error(
+          `Analysis backlink refresh failed: ${await parseApiErrorMessage(backlinksResponse)}`,
+        );
+      }
+
       const mergeResult = (await mergeResponse.json()) as WikiMaintenanceResult;
       const retryResult = (await retryResponse.json()) as WikiRetryFallbackResult;
       const enrichResult = (await enrichResponse.json()) as WikiEnrichResult;
+      const backlinksResult =
+        (await backlinksResponse.json()) as WikiAnalysisBacklinksResult;
 
       const appliedMerges = Number(mergeResult.applied_merges ?? 0);
       const rewrittenLinks = Number(mergeResult.rewritten_links ?? 0);
@@ -497,6 +525,13 @@ export function AppSidebar() {
       const repairedPages = Number(linkRepairResult?.repaired_pages ?? 0);
       const removedBrokenLinks = Number(linkRepairResult?.removed_links ?? 0);
 
+      const backlinkTargetPages = Number(backlinksResult.target_pages ?? 0);
+      const backlinkLinkedTargets = Number(
+        backlinksResult.linked_target_pages ?? 0,
+      );
+      const backlinkUpdatedPages = Number(backlinksResult.updated_pages ?? 0);
+      const backlinkRemovedSections = Number(backlinksResult.removed_sections ?? 0);
+
       const mergeErrors = Array.isArray(mergeResult.errors)
         ? mergeResult.errors.length
         : 0;
@@ -517,6 +552,9 @@ export function AppSidebar() {
       const webFillSummary = fillGapsFromWeb
         ? ` Web fill ${webGapEnabled ? "enabled" : "disabled"}: lint gaps: ${webLintMissingConcepts}, considered: ${webConceptsConsidered}, queries used: ${webQueriesUsed}, concepts created: ${webConceptsCreated}, planner ok: ${webPlannerOkConcepts}, selector ok: ${webSelectorOkConcepts}, direct results: ${webDirectResultsUsed}, failed concepts: ${webFailedConcepts}, audit entries: ${webAuditEntries}.`
         : "";
+      const backlinkSummary =
+        ` Backlinks: linked targets ${backlinkLinkedTargets}/${backlinkTargetPages}, ` +
+        `updated pages: ${backlinkUpdatedPages}, removed stale sections: ${backlinkRemovedSections}.`;
 
       const maintenanceTitle = fillGapsFromWeb
         ? "Wiki maintenance (with web fill) completed"
@@ -526,7 +564,7 @@ export function AppSidebar() {
         description:
           `Fallbacks found: ${fallbackFound}, regenerated: ${fallbackRegenerated}, still fallback: ${fallbackStill}. ` +
           `Applied merges: ${appliedMerges}, rewritten links: ${rewrittenLinks}, archived pages: ${archived}. ` +
-          `Enriched pages: ${enrichUpdated}/${enrichScanned}.${webFillSummary}${refreshSummary}${repairSummary} Errors: ${totalErrors}`,
+          `Enriched pages: ${enrichUpdated}/${enrichScanned}.${backlinkSummary}${webFillSummary}${refreshSummary}${repairSummary} Errors: ${totalErrors}`,
       });
       closeMobileIfOpen();
     } catch (error) {

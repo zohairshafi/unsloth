@@ -415,6 +415,83 @@ def test_watcher_can_force_source_only_mode(tmp_path: Path, monkeypatch):
     assert wiki_manager.calls[1]["preferred_context_only"] is True
 
 
+def test_watcher_persists_probe_result_without_second_generation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    sources_dir = tmp_path / "wiki" / "sources"
+    sources_dir.mkdir(parents = True)
+    (sources_dir / "source-slug.md").write_text("X" * 4000, encoding = "utf-8")
+
+    class _ProbePersistingWikiManager(_FakeWikiManager):
+        def __init__(self, wiki_dir: Path):
+            super().__init__(wiki_dir = wiki_dir)
+            self.persist_calls = 0
+
+        def query_rag(
+            self,
+            question: str,
+            query_context_max_chars_override = None,
+            save_answer: bool = True,
+            preferred_context_page: str | None = None,
+            keep_preferred_context_full: bool = False,
+            preferred_context_only: bool = False,
+        ):
+            result = super().query_rag(
+                question = question,
+                query_context_max_chars_override = query_context_max_chars_override,
+                save_answer = save_answer,
+                preferred_context_page = preferred_context_page,
+                keep_preferred_context_full = keep_preferred_context_full,
+                preferred_context_only = preferred_context_only,
+            )
+            if not save_answer:
+                result["_query_probe_payload"] = {
+                    "question": question,
+                    "answer": "probe-answer",
+                    "llm_answer": "probe-answer",
+                    "used_extractive_fallback": False,
+                    "low_quality_reason": None,
+                    "used_pages": [["sources/source-slug.md", 1.0]],
+                    "ranked_count": 1,
+                    "query_context_max_chars": query_context_max_chars_override,
+                }
+            return result
+
+        def persist_query_probe_result(
+            self,
+            probe_result: dict,
+            question: str | None = None,
+        ):
+            self.persist_calls += 1
+            payload = probe_result.get("_query_probe_payload")
+            return "analysis/from-probe" if isinstance(payload, dict) else None
+
+    wiki_manager = _ProbePersistingWikiManager(wiki_dir = tmp_path / "wiki")
+    ingestor = _FakeIngestor(wiki_manager)
+
+    handler = WikiFileEventHandler(
+        ingestor = ingestor,
+        contributor = "tester",
+        auto_analyze = True,
+        llm_available_fn = lambda: True,
+        llm_context_window_tokens_fn = lambda: 8192,
+        analysis_context_fraction = 0.70,
+        analysis_chars_per_token = 4,
+    )
+
+    monkeypatch.setattr("core.wiki.watcher.time.sleep", lambda _seconds: None)
+
+    raw_file = tmp_path / "paper-probe-persist.txt"
+    raw_file.write_text("content", encoding = "utf-8")
+
+    handler._process_file(raw_file)
+
+    assert len(wiki_manager.calls) == 1
+    assert wiki_manager.calls[0]["save_answer"] is False
+    assert wiki_manager.persist_calls == 1
+
+
 def test_watcher_retries_after_failed_ingest(tmp_path: Path, monkeypatch):
     wiki_manager = _FakeWikiManager(wiki_dir = tmp_path / "wiki")
     ingestor = _FakeIngestor(wiki_manager)

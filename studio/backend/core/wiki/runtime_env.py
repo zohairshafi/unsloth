@@ -334,6 +334,19 @@ WIKI_ENV_SPECS: tuple[WikiEnvSpec, ...] = (
         description = "Enable LLM reranking for wiki candidates.",
     ),
     WikiEnvSpec(
+        name = "UNSLOTH_WIKI_ENGINE_LLM_RERANK_INCLUDE_ANALYSIS_PAGES",
+        kind = "bool",
+        default = "true",
+        description = "Include analysis pages in the initial LLM rerank seed pool (before link expansion).",
+    ),
+    WikiEnvSpec(
+        name = "UNSLOTH_WIKI_ENGINE_LLM_RERANK_MIN_CANDIDATES",
+        kind = "int",
+        default = "3",
+        description = "Minimum candidate count kept before planner LLM selection.",
+        minimum = 1,
+    ),
+    WikiEnvSpec(
         name = "UNSLOTH_WIKI_ENGINE_LLM_RERANK_CANDIDATES",
         kind = "int",
         default = "32",

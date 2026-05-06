@@ -88,6 +88,17 @@ class WikiManager:
             preferred_context_only = preferred_context_only,
         )
 
+    def persist_query_probe_result(
+        self,
+        probe_result: Dict,
+        question: Optional[str] = None,
+    ) -> Optional[str]:
+        """Persist a probe query result without re-running model generation."""
+        return self.engine.persist_query_probe_result(
+            probe_result,
+            question = question,
+        )
+
     def retrieve_context(
         self,
         question: str,
@@ -211,6 +222,19 @@ class WikiManager:
         return self.engine.retry_fallback_analysis_pages(
             dry_run = dry_run,
             max_analysis_pages = max_analysis_pages,
+        )
+
+    def refresh_analysis_backlinks(
+        self,
+        dry_run: bool = True,
+        max_analysis_pages: int = 256,
+        max_links_per_page: int = 128,
+    ) -> Dict:
+        """Populate entity/concept backlink sections from analysis-page wikilinks."""
+        return self.engine.refresh_analysis_backlinks(
+            dry_run = dry_run,
+            max_analysis_pages = max_analysis_pages,
+            max_links_per_page = max_links_per_page,
         )
 
     def merge_duplicate_knowledge_pages(

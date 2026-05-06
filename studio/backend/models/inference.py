@@ -408,6 +408,10 @@ class ChatMessage(BaseModel):
         None,
         description = "OpenAI assistant messages: structured tool calls the model decided to make.",
     )
+    reasoning_content: Optional[str] = Field(
+        None,
+        description = "Optional assistant reasoning trace for providers that support reasoning_content.",
+    )
     name: Optional[str] = Field(
         None,
         description = "OpenAI tool-result messages: name of the tool whose result this is.",
@@ -429,6 +433,10 @@ class ChatMessage(BaseModel):
             raise ValueError('"tool_call_id" is only valid on role="tool" messages.')
         if self.name is not None and self.role != "tool":
             raise ValueError('"name" is only valid on role="tool" messages.')
+        if self.reasoning_content is not None and self.role != "assistant":
+            raise ValueError(
+                '"reasoning_content" is only valid on role="assistant" messages.'
+            )
 
         # Per-role content requirements.
         if self.role == "tool":
@@ -855,6 +863,73 @@ class WikiIngestResponse(BaseModel):
     results: list[Dict[str, Any]]
 
 
+class WikiChatHistoryMessage(BaseModel):
+    """One chat message snapshot for manual wiki history persistence."""
+
+    role: str = Field(..., min_length = 1, max_length = 32)
+    id: Optional[str] = Field(
+        None,
+        max_length = 256,
+        description = "Optional client-side message identifier",
+    )
+    created_at: Optional[str] = Field(
+        None,
+        max_length = 128,
+        description = "Optional ISO timestamp from the chat runtime",
+    )
+    content: Optional[Union[str, list[Dict[str, Any]], Dict[str, Any]]] = Field(
+        None,
+        description = "Message content (text or structured parts)",
+    )
+    reasoning_content: Optional[str] = Field(
+        None,
+        description = "Optional assistant reasoning trace",
+    )
+    attachments: Optional[list[Dict[str, Any]]] = Field(
+        None,
+        description = "Optional attachment payloads from the chat runtime",
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        None,
+        description = "Optional runtime metadata to preserve with the snapshot",
+    )
+
+
+class WikiChatHistorySaveRequest(BaseModel):
+    """Request payload for manually writing chat history into wiki raw/."""
+
+    thread_id: str = Field(
+        ...,
+        min_length = 1,
+        max_length = 256,
+        description = "Stable thread identifier used to derive overwrite path",
+    )
+    thread_title: Optional[str] = Field(
+        None,
+        max_length = 1024,
+        description = "Optional thread title included in the saved markdown header",
+    )
+    messages: list[WikiChatHistoryMessage] = Field(
+        ...,
+        min_length = 1,
+        max_length = 40000,
+        description = "Full thread messages to persist",
+    )
+
+
+class WikiChatHistorySaveResponse(BaseModel):
+    """Response for manual wiki chat-history save/update operations."""
+
+    status: Literal["ok"] = "ok"
+    operation: Literal["created", "updated"]
+    thread_id: str
+    file_path: str
+    relative_path: str
+    message_count: int
+    watcher_enabled: bool
+    ingested_immediately: bool
+
+
 class WikiEnrichRequest(BaseModel):
     """Request payload for index-driven enrichment of analysis pages."""
 
@@ -946,6 +1021,41 @@ class WikiRetryFallbackResponse(BaseModel):
     skipped_no_question: int
     errors: list[str]
     results: list[Dict[str, Any]]
+
+
+class WikiAnalysisBacklinksRequest(BaseModel):
+    """Request payload for refreshing entity/concept backlinks from analysis pages."""
+
+    dry_run: bool = Field(
+        True,
+        description = "If true, report backlink changes without writing files",
+    )
+    max_analysis_pages: int = Field(
+        256,
+        ge = 1,
+        le = 5000,
+        description = "Maximum number of analysis pages to scan for backlink extraction",
+    )
+    max_links_per_page: int = Field(
+        128,
+        ge = 1,
+        le = 2000,
+        description = "Maximum analysis backlinks listed per entity/concept page",
+    )
+
+
+class WikiAnalysisBacklinksResponse(BaseModel):
+    """Result of refreshing entity/concept backlinks from analysis pages."""
+
+    status: str
+    dry_run: bool
+    scanned_analysis_pages: int
+    target_pages: int
+    linked_target_pages: int
+    updated_pages: int
+    removed_sections: int
+    max_links_per_page: int
+    changes: list[Dict[str, Any]]
 
 
 class WikiMergeMaintenanceRequest(BaseModel):

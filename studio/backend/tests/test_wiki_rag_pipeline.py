@@ -1174,6 +1174,69 @@ def test_get_wiki_data_graph_uses_index_summary_for_analysis_labels(tmp_path: Pa
     assert "Alpha Research Paper" in str(analysis_node.get("label", ""))
 
 
+def test_get_wiki_data_graph_dedupes_duplicate_links_for_counts_and_edges(tmp_path: Path):
+    engine = LLMWikiEngine(cfg = WikiConfig(vault_root = tmp_path), llm_fn = lambda _: "{}")
+
+    (tmp_path / "wiki" / "sources" / "alpha.md").write_text(
+        "# Alpha Source\n\n"
+        "Repeated refs: [[entities/alpha-entity]] [[entities/alpha-entity]] [[entities/alpha-entity|Alpha Entity]].\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "entities" / "alpha-entity.md").write_text(
+        "# Alpha Entity\n",
+        encoding = "utf-8",
+    )
+
+    graph = engine.get_wiki_data_graph(include_analysis = False)
+
+    edge_ids = [edge["id"] for edge in graph["edges"]]
+    assert edge_ids.count("sources/alpha->entities/alpha-entity") == 1
+
+    source_node = next(node for node in graph["nodes"] if node["id"] == "sources/alpha")
+    entity_node = next(
+        node for node in graph["nodes"] if node["id"] == "entities/alpha-entity"
+    )
+    assert int(source_node["outbound_links"]) == 1
+    assert int(entity_node["inbound_links"]) == 1
+
+
+def test_get_wiki_data_graph_analysis_labels_remain_informative_when_analysis_omitted_from_index(
+    tmp_path: Path,
+):
+    engine = LLMWikiEngine(cfg = WikiConfig(vault_root = tmp_path), llm_fn = lambda _: "{}")
+    engine.cfg.index_include_analysis_pages = False
+
+    (tmp_path / "wiki" / "sources" / "alpha.md").write_text(
+        "---\n"
+        "title: Alpha Research Paper\n"
+        "type: source\n"
+        "source_ref: local\n"
+        "---\n\n"
+        "# Alpha Research Paper\n\n"
+        "Source text here.\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "analysis" / "alpha-summary.md").write_text(
+        "# Query Result\n\n"
+        "## Question\n"
+        "Summarize source 'Alpha Research Paper' with a source-first lens. Primary page: [[sources/alpha]].\n\n"
+        "## Answer\n"
+        "Section A: grounded summary with source link [[sources/alpha]].\n",
+        encoding = "utf-8",
+    )
+    engine._rebuild_index()
+
+    graph = engine.get_wiki_data_graph(include_analysis = True)
+    analysis_node = next(
+        (node for node in graph["nodes"] if node.get("id") == "analysis/alpha-summary"),
+        None,
+    )
+
+    assert analysis_node is not None
+    assert str(analysis_node.get("label", "")).strip() != "Query Result"
+    assert "Alpha Research Paper" in str(analysis_node.get("label", ""))
+
+
 def test_manager_retrieve_context_zero_limits_return_full_content(tmp_path: Path):
     manager = WikiManager.create(vault_root = tmp_path, llm_fn = lambda _: "{}")
 
@@ -1287,7 +1350,9 @@ def test_rank_pages_link_expansion_can_use_llm_selector(tmp_path: Path):
     assert "concepts/beta.md" in ranked_paths
 
 
-def test_rank_pages_link_expansion_llm_selector_invalid_does_not_expand(tmp_path: Path):
+def test_rank_pages_link_expansion_llm_selector_invalid_falls_back_to_lexical(
+    tmp_path: Path,
+):
     def _llm(prompt: str) -> str:
         if "link expansion selector" in prompt:
             return "not-json"
@@ -1324,8 +1389,47 @@ def test_rank_pages_link_expansion_llm_selector_invalid_does_not_expand(tmp_path
     ranked = engine._rank_pages("alpha unique query token")
     ranked_paths = [rel for rel, _ in ranked]
 
-    assert "concepts/gamma.md" not in ranked_paths
-    assert "concepts/beta.md" not in ranked_paths
+    assert "concepts/gamma.md" in ranked_paths
+
+
+def test_rank_pages_link_expansion_supports_depth_four(tmp_path: Path):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = lambda _: "{}",
+    )
+
+    (tmp_path / "wiki" / "sources" / "seed.md").write_text(
+        "# Seed\n\n"
+        "alpha unique retrieval anchor token\n\n"
+        "[[entities/bridge-1]]\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "entities" / "bridge-1.md").write_text(
+        "# Bridge 1\n\n[[concepts/bridge-2]]\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "concepts" / "bridge-2.md").write_text(
+        "# Bridge 2\n\n[[entities/bridge-3]]\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "entities" / "bridge-3.md").write_text(
+        "# Bridge 3\n\n[[analysis/deep-result]]\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "analysis" / "deep-result.md").write_text(
+        "# Deep Result\n\nNo lexical overlap here.\n",
+        encoding = "utf-8",
+    )
+
+    engine.cfg.ranking_llm_rerank_enabled = False
+    engine.cfg.ranking_link_llm_selector_enabled = False
+    engine.cfg.ranking_link_depth = 4
+    engine.cfg.ranking_link_fanout = 3
+
+    ranked = engine._rank_pages("alpha unique retrieval anchor token")
+    ranked_paths = [rel for rel, _ in ranked]
+
+    assert "analysis/deep-result.md" in ranked_paths
 
 
 def test_rank_pages_boosts_entity_targets_for_who_is_queries(tmp_path: Path):
@@ -1374,7 +1478,7 @@ def test_entity_query_focus_uses_llm_parser_when_available(tmp_path: Path):
     assert "doe" in terms
 
 
-def test_rank_pages_falls_back_to_recency_when_no_match(tmp_path: Path):
+def test_rank_pages_falls_back_to_deterministic_kind_order_when_no_match(tmp_path: Path):
     engine = LLMWikiEngine(
         cfg = WikiConfig(vault_root = tmp_path),
         llm_fn = lambda _: "{}",
@@ -1384,9 +1488,6 @@ def test_rank_pages_falls_back_to_recency_when_no_match(tmp_path: Path):
     newer_page = tmp_path / "wiki" / "sources" / "newer.md"
     older_page.write_text("# Older\n\nGeneral notes.\n", encoding = "utf-8")
     newer_page.write_text("# Newer\n\nMore general notes.\n", encoding = "utf-8")
-
-    os.utime(older_page, (1_700_000_000, 1_700_000_000))
-    os.utime(newer_page, (1_900_000_000, 1_900_000_000))
 
     ranked = engine._rank_pages("qzvjkplm")
     ranked_paths = [rel for rel, _ in ranked]
@@ -1569,10 +1670,6 @@ def test_rank_pages_does_not_promote_unrelated_entity_on_person_query(tmp_path: 
         "# Recent Notes\n\nGeneral context page with no person match.\n",
         encoding = "utf-8",
     )
-
-    # Ensure deterministic recency ordering for zero-match fallback.
-    os.utime(unrelated_entity, (1_700_000_000, 1_700_000_000))
-    os.utime(recent_source, (1_900_000_000, 1_900_000_000))
 
     ranked = engine._rank_pages("Who is Zohair?")
     ranked_paths = [rel for rel, _ in ranked]
@@ -1905,6 +2002,125 @@ def test_enrich_analysis_pages_prepends_enrichment_section(tmp_path: Path):
     assert second_report["updated_pages"] == 0
 
 
+def test_refresh_analysis_backlinks_updates_entity_and_concept_pages(tmp_path: Path):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = lambda _: "{}",
+    )
+
+    entity_path = tmp_path / "wiki" / "entities" / "retrieval-pipeline.md"
+    concept_path = tmp_path / "wiki" / "concepts" / "vector-search.md"
+    entity_path.write_text(
+        "# Retrieval Pipeline\n\n## Summary\nentity summary\n",
+        encoding = "utf-8",
+    )
+    concept_path.write_text(
+        "# Vector Search\n\n## Summary\nconcept summary\n",
+        encoding = "utf-8",
+    )
+
+    analysis_path = tmp_path / "wiki" / "analysis" / "sample.md"
+    analysis_path.write_text(
+        "# Query Result\n\n"
+        "## Answer\n"
+        "See [[entities/retrieval-pipeline]] and [[concepts/vector-search]].\n",
+        encoding = "utf-8",
+    )
+
+    report = engine.refresh_analysis_backlinks(
+        dry_run = False,
+        max_analysis_pages = 10,
+        max_links_per_page = 16,
+    )
+
+    assert report["status"] == "ok"
+    assert report["updated_pages"] == 2
+    assert report["linked_target_pages"] == 2
+
+    entity_text = entity_path.read_text(encoding = "utf-8")
+    concept_text = concept_path.read_text(encoding = "utf-8")
+
+    assert "## Referenced by Analyses" in entity_text
+    assert "## Referenced by Analyses" in concept_text
+    assert "[[analysis/sample]]" in entity_text
+    assert "[[analysis/sample]]" in concept_text
+
+    analysis_path.unlink()
+    cleanup_report = engine.refresh_analysis_backlinks(
+        dry_run = False,
+        max_analysis_pages = 10,
+        max_links_per_page = 16,
+    )
+
+    assert cleanup_report["status"] == "ok"
+    assert cleanup_report["removed_sections"] >= 2
+    assert "## Referenced by Analyses" not in entity_path.read_text(encoding = "utf-8")
+    assert "## Referenced by Analyses" not in concept_path.read_text(encoding = "utf-8")
+
+
+def test_refresh_analysis_backlinks_infers_mentions_from_analysis_and_source(tmp_path: Path):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = lambda _: "{}",
+    )
+
+    entity_path = tmp_path / "wiki" / "entities" / "retrieval-pipeline.md"
+    concept_path = tmp_path / "wiki" / "concepts" / "vector-search.md"
+    source_path = tmp_path / "wiki" / "sources" / "paper-a.md"
+    analysis_path = tmp_path / "wiki" / "analysis" / "source-first.md"
+
+    entity_path.write_text(
+        "# Retrieval Pipeline\n\n## Summary\nentity summary\n",
+        encoding = "utf-8",
+    )
+    concept_path.write_text(
+        "# Vector Search\n\n## Summary\nconcept summary\n",
+        encoding = "utf-8",
+    )
+    source_path.write_text(
+        "# Paper A\n\n"
+        "## Summary\n"
+        "The source discusses vector search quality and ranking trade-offs.\n\n"
+        "## Entities Mentioned\n"
+        "- none\n\n"
+        "## Concepts Mentioned\n"
+        "- none\n",
+        encoding = "utf-8",
+    )
+    analysis_path.write_text(
+        "# Query Result\n\n"
+        "## Question\n"
+        "Summarize source 'Paper A' with a source-first lens.\n"
+        "Primary page to ground on: [[sources/paper-a]].\n\n"
+        "## Answer\n"
+        "A retrieval pipeline improves precision when composing context windows.\n",
+        encoding = "utf-8",
+    )
+
+    report = engine.refresh_analysis_backlinks(
+        dry_run = False,
+        max_analysis_pages = 10,
+        max_links_per_page = 16,
+    )
+
+    assert report["status"] == "ok"
+    assert report["updated_pages"] == 2
+    assert report["linked_target_pages"] == 2
+    assert report["resolved_primary_source_pages"] == 1
+
+    signal_counts = report.get("signal_counts", {})
+    assert signal_counts.get("analysis_mention", 0) >= 1
+    assert signal_counts.get("source_mention", 0) >= 1
+
+    entity_text = entity_path.read_text(encoding = "utf-8")
+    concept_text = concept_path.read_text(encoding = "utf-8")
+
+    assert "## Referenced by Analyses" in entity_text
+    assert "## Referenced by Analyses" in concept_text
+    assert "[[analysis/source-first]]" in entity_text
+    assert "[[analysis/source-first]]" in concept_text
+
+
 def test_enrich_link_selection_can_use_llm_selector(tmp_path: Path):
     def _llm(prompt: str) -> str:
         if "enrichment link selector for wiki analysis maintenance" in prompt:
@@ -2075,7 +2291,10 @@ def test_enrich_analysis_pages_dry_run_does_not_edit_file(tmp_path: Path):
 
 def test_enrich_repairs_broken_links_only_in_maintenance_sections(tmp_path: Path):
     engine = LLMWikiEngine(
-        cfg = WikiConfig(vault_root = tmp_path),
+        cfg = WikiConfig(
+            vault_root = tmp_path,
+            enrichment_repair_answer_links = False,
+        ),
         llm_fn = lambda _: "{}",
     )
 
@@ -3221,6 +3440,110 @@ def test_query_source_first_uses_primary_source_only_context(tmp_path: Path):
     assert result["context_pages"] == ["sources/alpha.md"]
 
 
+def test_query_source_first_auto_preferred_only_skips_ranking(
+    tmp_path: Path,
+    monkeypatch,
+):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(
+            vault_root = tmp_path,
+            max_context_pages = 0,
+            max_chars_per_page = 0,
+            query_context_max_chars = 12000,
+        ),
+        llm_fn = lambda _: "Grounded source summary. [[sources/alpha]]",
+    )
+
+    (tmp_path / "wiki" / "sources" / "alpha.md").write_text(
+        "# Alpha\n\nAlpha source details for source-first summary.\n",
+        encoding = "utf-8",
+    )
+
+    def _unexpected_rank(_question: str):
+        raise AssertionError("_rank_pages should not run for source-first preferred context")
+
+    monkeypatch.setattr(engine, "_rank_pages", _unexpected_rank)
+
+    result = engine.query(
+        "Summarize source 'Alpha' with a source-first lens. Primary page: [[sources/alpha]].",
+        save_answer = False,
+    )
+
+    assert result["context_pages"] == ["sources/alpha.md"]
+
+
+def test_query_preferred_context_only_existing_page_skips_ranking(
+    tmp_path: Path,
+    monkeypatch,
+):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(
+            vault_root = tmp_path,
+            max_context_pages = 0,
+            max_chars_per_page = 0,
+            query_context_max_chars = 12000,
+        ),
+        llm_fn = lambda _: "Grounded source summary. [[sources/alpha]]",
+    )
+
+    (tmp_path / "wiki" / "sources" / "alpha.md").write_text(
+        "# Alpha\n\nPrimary source details.\n",
+        encoding = "utf-8",
+    )
+
+    def _unexpected_rank(_question: str):
+        raise AssertionError("_rank_pages should not run for preferred-only context")
+
+    monkeypatch.setattr(engine, "_rank_pages", _unexpected_rank)
+
+    result = engine.query(
+        "Summarize alpha",
+        save_answer = False,
+        preferred_context_page = "sources/alpha",
+        preferred_context_only = True,
+    )
+
+    assert result["context_pages"] == ["sources/alpha.md"]
+
+
+def test_persist_query_probe_result_avoids_second_llm_call(tmp_path: Path):
+    llm_calls = {"count": 0}
+
+    def _llm(_prompt: str) -> str:
+        llm_calls["count"] += 1
+        return "Grounded source summary. [[sources/alpha]]"
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(
+            vault_root = tmp_path,
+            max_context_pages = 0,
+            max_chars_per_page = 0,
+            query_context_max_chars = 12000,
+        ),
+        llm_fn = _llm,
+    )
+
+    (tmp_path / "wiki" / "sources" / "alpha.md").write_text(
+        "# Alpha\n\nPrimary source details.\n",
+        encoding = "utf-8",
+    )
+
+    probe = engine.query(
+        "Summarize alpha",
+        save_answer = False,
+        preferred_context_page = "sources/alpha",
+        preferred_context_only = True,
+    )
+
+    assert llm_calls["count"] == 1
+
+    answer_page = engine.persist_query_probe_result(probe, question = "Summarize alpha")
+
+    assert answer_page is not None
+    assert llm_calls["count"] == 1
+    assert (tmp_path / "wiki" / f"{answer_page}.md").exists()
+
+
 def test_query_source_first_injects_primary_source_when_ranking_omits_it(
     tmp_path: Path,
     monkeypatch,
@@ -3958,6 +4281,44 @@ def test_index_analysis_summary_can_generate_llm_title_when_flag_enabled(
     assert "[[sources/2508-20330v4]]" in line
 
 
+def test_index_analysis_summary_reuses_cached_title_for_unchanged_page(
+    tmp_path: Path,
+):
+    llm_calls = {"count": 0}
+
+    def _llm(prompt: str) -> str:
+        if "concise index title for a wiki analysis page" in prompt:
+            llm_calls["count"] += 1
+            return '{"title":"Cached Index Title"}'
+        return "{}"
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = _llm,
+    )
+    engine.cfg.index_llm_title_on_rebuild = True
+
+    analysis_page = tmp_path / "wiki" / "analysis" / "cached-title.md"
+    analysis_page.write_text(
+        "# Query Result\n\n"
+        "## Question\n"
+        "Summarize source '2508.20330v4' with a source-first lens. "
+        "Primary page: [[sources/2508-20330v4]].\n\n"
+        "## Answer Mode\nllm\n\n"
+        "## Answer\n"
+        "Section A: Cached title regression check.\n\n"
+        "## Context Pages\n"
+        "- [[sources/2508-20330v4]]\n",
+        encoding = "utf-8",
+    )
+
+    engine._rebuild_index()
+    assert llm_calls["count"] == 1
+
+    engine._rebuild_index()
+    assert llm_calls["count"] == 1
+
+
 def test_index_analysis_summary_llm_title_invalid_falls_back_when_flag_enabled(
     tmp_path: Path,
 ):
@@ -4043,7 +4404,7 @@ def test_rebuild_index_omits_sources_when_source_index_disabled(
     assert "[[entities/alpha-entity]]" in index_text
 
 
-def test_llm_rerank_uses_compact_index_without_sources_when_disabled(
+def test_llm_rerank_omits_sources_when_index_sources_are_disabled(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -4080,6 +4441,161 @@ def test_llm_rerank_uses_compact_index_without_sources_when_disabled(
     assert "entities/alpha.md" in prompt
     assert "sources/alpha.md" not in prompt
     assert "(omitted by source-exclusion policy)" in prompt
+
+
+def test_llm_rerank_omits_analysis_when_rerank_analysis_candidates_are_disabled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("UNSLOTH_WIKI_ENGINE_LLM_RERANK_INCLUDE_ANALYSIS_PAGES", "false")
+
+    captured = {"prompt": ""}
+
+    def _llm(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return '{"ordered_pages": ["analysis/alpha-analysis.md", "entities/alpha.md"]}'
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = _llm,
+    )
+
+    (tmp_path / "wiki" / "entities" / "alpha.md").write_text(
+        "# Alpha Entity\n\nentity detail\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "analysis" / "alpha-analysis.md").write_text(
+        "# Query Result\n\n## Answer\nDetailed analysis answer body.\n",
+        encoding = "utf-8",
+    )
+    engine._rebuild_index()
+
+    reranked = engine._llm_rerank_candidates(
+        "alpha details",
+        [("analysis/alpha-analysis.md", 1.0), ("entities/alpha.md", 0.8)],
+    )
+
+    assert reranked
+    prompt = captured["prompt"]
+    assert "analysis/alpha-analysis.md" not in prompt
+    assert "entities/alpha.md" in prompt
+    assert [rel for rel, _score in reranked] == ["entities/alpha.md"]
+
+
+def test_llm_rerank_adds_link_expanded_analysis_when_analysis_seed_disabled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("UNSLOTH_WIKI_ENGINE_LLM_RERANK_INCLUDE_ANALYSIS_PAGES", "false")
+
+    captured = {"prompt": ""}
+
+    def _llm(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return '{"ordered_pages": ["analysis/alpha-analysis.md", "entities/alpha.md"]}'
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = _llm,
+    )
+    engine.cfg.ranking_link_depth = 1
+
+    (tmp_path / "wiki" / "entities" / "alpha.md").write_text(
+        "# Alpha Entity\n\nLinks: [[analysis/alpha-analysis]].\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "analysis" / "alpha-analysis.md").write_text(
+        "# Query Result\n\n## Answer\nDetailed analysis answer body.\n",
+        encoding = "utf-8",
+    )
+    engine._rebuild_index()
+
+    reranked = engine._llm_rerank_candidates(
+        "alpha details",
+        [("entities/alpha.md", 1.0)],
+    )
+
+    assert reranked
+    prompt = captured["prompt"]
+    assert "entities/alpha.md" in prompt
+    assert "analysis/alpha-analysis.md" not in prompt
+    reranked_paths = [rel for rel, _score in reranked]
+    assert reranked_paths[0] == "entities/alpha.md"
+    assert "analysis/alpha-analysis.md" in reranked_paths
+
+
+def test_rebuild_index_lists_all_sections_when_enabled(tmp_path: Path):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = lambda _: "{}",
+    )
+
+    (tmp_path / "wiki" / "sources" / "alpha.md").write_text(
+        "# Alpha Source\n\nsource detail\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "entities" / "alpha-entity.md").write_text(
+        "# Alpha Entity\n\nentity detail\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "concepts" / "alpha-concept.md").write_text(
+        "# Alpha Concept\n\nconcept detail\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "analysis" / "alpha-analysis.md").write_text(
+        "# Alpha Analysis\n\nanalysis detail\n",
+        encoding = "utf-8",
+    )
+
+    engine._rebuild_index()
+
+    index_text = (tmp_path / "wiki" / "index.md").read_text(encoding = "utf-8")
+
+    assert "## Sources" in index_text
+    assert "## Entities" in index_text
+    assert "## Concepts" in index_text
+    assert "## Analysis" in index_text
+    assert "(omitted by" not in index_text
+    assert "[[entities/alpha-entity]]" in index_text
+    assert "[[concepts/alpha-concept]]" in index_text
+    assert "[[sources/alpha]]" in index_text
+    assert "[[analysis/alpha-analysis]]" in index_text
+
+
+def test_llm_rerank_prompt_keeps_analysis_candidates_when_index_has_analysis_entries(
+    tmp_path: Path,
+):
+    captured = {"prompt": ""}
+
+    def _llm(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return '{"ordered_pages": ["analysis/alpha-analysis.md", "entities/alpha.md"]}'
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = _llm,
+    )
+
+    (tmp_path / "wiki" / "entities" / "alpha.md").write_text(
+        "# Alpha Entity\n\nentity detail\n",
+        encoding = "utf-8",
+    )
+    (tmp_path / "wiki" / "analysis" / "alpha-analysis.md").write_text(
+        "# Query Result\n\n## Answer\nDetailed analysis answer body.\n",
+        encoding = "utf-8",
+    )
+
+    engine._rebuild_index()
+
+    reranked = engine._llm_rerank_candidates(
+        "alpha details",
+        [("analysis/alpha-analysis.md", 1.0), ("entities/alpha.md", 0.8)],
+    )
+
+    assert reranked
+    prompt = captured["prompt"]
+    assert "analysis/alpha-analysis.md" in prompt
+    assert "entities/alpha.md" in prompt
 
 
 def test_lint_reports_entity_and_concept_merge_candidates(tmp_path: Path):

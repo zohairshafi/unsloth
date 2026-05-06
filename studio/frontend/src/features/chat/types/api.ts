@@ -154,6 +154,7 @@ export interface AudioGenerationResponse {
 export interface OpenAIChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  reasoning_content?: string;
 }
 
 export interface OpenAIChatCompletionsRequest {
@@ -186,6 +187,7 @@ export interface OpenAIChatCompletionsRequest {
 export interface OpenAIChatDelta {
   role?: string;
   content?: string;
+  reasoning_content?: string;
 }
 
 export interface OpenAIChatChunkChoice {
@@ -201,4 +203,31 @@ export interface OpenAIChatChunk {
     total_tokens: number;
   };
   timings?: Record<string, number>;
+}
+
+export interface WikiChatHistoryMessage {
+  role: string;
+  id?: string;
+  created_at?: string;
+  content?: unknown;
+  reasoning_content?: string;
+  attachments?: unknown;
+  metadata?: Record<string, unknown>;
+}
+
+export interface WikiChatHistorySaveRequest {
+  thread_id: string;
+  thread_title?: string | null;
+  messages: WikiChatHistoryMessage[];
+}
+
+export interface WikiChatHistorySaveResponse {
+  status: "ok";
+  operation: "created" | "updated";
+  thread_id: string;
+  file_path: string;
+  relative_path: string;
+  message_count: number;
+  watcher_enabled: boolean;
+  ingested_immediately: boolean;
 }

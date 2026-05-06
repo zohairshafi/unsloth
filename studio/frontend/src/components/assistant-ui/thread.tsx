@@ -31,6 +31,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { saveWikiChatHistory } from "@/features/chat/api/chat-api";
 import { sentAudioNames } from "@/features/chat/api/chat-adapter";
 import { useChatRuntimeStore } from "@/features/chat/stores/chat-runtime-store";
 import { applyQwenThinkingParams } from "@/features/chat/utils/qwen-params";
@@ -382,6 +383,96 @@ const ComposerAudioUpload: FC = () => {
   );
 };
 
+type WikiHistorySnapshotMessage = {
+  role: string;
+  id?: string;
+  created_at?: string;
+  content?: unknown;
+  reasoning_content?: string;
+  attachments?: unknown;
+  metadata?: Record<string, unknown>;
+};
+
+function cloneForWikiHistory<T>(value: T): T {
+  try {
+    return JSON.parse(JSON.stringify(value)) as T;
+  } catch {
+    return value;
+  }
+}
+
+function collectReasoningTextForWiki(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  const reasoningParts = content
+    .map((part) => {
+      if (!part || typeof part !== "object") {
+        return "";
+      }
+      const typed = part as { type?: unknown; text?: unknown; content?: unknown };
+      if (String(typed.type ?? "").toLowerCase() !== "reasoning") {
+        return "";
+      }
+      if (typeof typed.text === "string") {
+        return typed.text.trim();
+      }
+      if (typeof typed.content === "string") {
+        return typed.content.trim();
+      }
+      return "";
+    })
+    .filter((item): item is string => Boolean(item));
+
+  return reasoningParts.join("\n\n").trim();
+}
+
+function snapshotThreadMessagesForWiki(messages: readonly unknown[]): WikiHistorySnapshotMessage[] {
+  const snapshots: WikiHistorySnapshotMessage[] = [];
+
+  for (const rawMessage of messages) {
+    if (!rawMessage || typeof rawMessage !== "object") {
+      continue;
+    }
+
+    const message = rawMessage as Record<string, unknown>;
+    const role = typeof message.role === "string" ? message.role : "unknown";
+    const id = typeof message.id === "string" ? message.id : undefined;
+
+    let createdAt: string | undefined;
+    const rawCreatedAt = message.createdAt;
+    if (rawCreatedAt instanceof Date) {
+      createdAt = rawCreatedAt.toISOString();
+    } else if (typeof rawCreatedAt === "string") {
+      createdAt = rawCreatedAt;
+    }
+
+    const content = cloneForWikiHistory(message.content);
+    const reasoningContent = collectReasoningTextForWiki(content);
+    const attachments = cloneForWikiHistory(message.attachments);
+
+    let metadata: Record<string, unknown> | undefined;
+    if (message.metadata && typeof message.metadata === "object" && !Array.isArray(message.metadata)) {
+      metadata = cloneForWikiHistory(message.metadata as Record<string, unknown>);
+    }
+
+    const snapshot: WikiHistorySnapshotMessage = {
+      role,
+      ...(id ? { id } : {}),
+      ...(createdAt ? { created_at: createdAt } : {}),
+      ...(content !== undefined ? { content } : {}),
+      ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+      ...(attachments !== undefined ? { attachments } : {}),
+      ...(metadata ? { metadata } : {}),
+    };
+
+    snapshots.push(snapshot);
+  }
+
+  return snapshots;
+}
+
 
 const ReasoningToggle: FC = () => {
   const modelLoaded = useChatRuntimeStore(
@@ -644,6 +735,85 @@ const CodeToolsToggle: FC = () => {
   );
 };
 
+const WikiChatHistoryToggle: FC = () => {
+  const aui = useAui();
+  const threadId = useAuiState(({ threads }) => threads.mainThreadId);
+  const isThreadRunning = useAuiState(({ thread }) => thread.isRunning);
+
+  const [isSaving, setIsSaving] = useState(false);
+  const [savedThreadIds, setSavedThreadIds] = useState<Record<string, boolean>>({});
+
+  const hasSavedCurrentThread = threadId ? Boolean(savedThreadIds[threadId]) : false;
+  const label = hasSavedCurrentThread ? "Update chat history" : "Log chat history";
+  const disabled = !threadId || isThreadRunning || isSaving;
+
+  const handleSave = useCallback(async () => {
+    if (!threadId) {
+      return;
+    }
+
+    const threadState = aui.thread().getState() as {
+      messages?: readonly unknown[];
+    };
+    const snapshots = snapshotThreadMessagesForWiki(threadState.messages ?? []);
+    if (snapshots.length === 0) {
+      toast.error("No chat messages to log yet.");
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const threadListItemState = aui.threadListItem().getState() as {
+        title?: string;
+      };
+      const result = await saveWikiChatHistory({
+        thread_id: threadId,
+        thread_title:
+          typeof threadListItemState.title === "string"
+            ? threadListItemState.title
+            : null,
+        messages: snapshots,
+      });
+
+      setSavedThreadIds((prev) => ({ ...prev, [threadId]: true }));
+      toast.success(
+        result.operation === "created"
+          ? "Chat history logged"
+          : "Chat history updated",
+        {
+          description: result.relative_path,
+        },
+      );
+    } catch (error) {
+      toast.error("Failed to save chat history", {
+        description: error instanceof Error ? error.message : "Unknown error",
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  }, [aui, threadId]);
+
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => {
+        void handleSave();
+      }}
+      className={cn(
+        "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+        disabled
+          ? "cursor-not-allowed opacity-40"
+          : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+      )}
+      aria-label={label}
+    >
+      <DownloadIcon className="size-3.5" />
+      <span>{isSaving ? "Saving..." : label}</span>
+    </button>
+  );
+};
+
 const ToolStatusDisplay: FC = () => {
   const toolStatus = useChatRuntimeStore((s) => s.toolStatus);
   const isThreadRunning = useAuiState(({ thread }) => thread.isRunning);
@@ -713,6 +883,7 @@ const ComposerAction: FC<{ disabled?: boolean }> = ({ disabled }) => {
         <PreserveThinkingToggle />
         <WebSearchToggle />
         <CodeToolsToggle />
+        <WikiChatHistoryToggle />
       </div>
       <div className="shrink-0 flex items-center gap-1">
         <ComposerPrimitive.If dictation={false}>

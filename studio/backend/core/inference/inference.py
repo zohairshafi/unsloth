@@ -1069,9 +1069,6 @@ class InferenceBackend:
                     template_messages.insert(0, context_message)
             else:
                 logger.info("RAG produced empty context for transformer request")
-
-            # Save history for future RAG.
-            self._save_chat_history_to_wiki(messages)
         # ------------------------------------
 
         try:

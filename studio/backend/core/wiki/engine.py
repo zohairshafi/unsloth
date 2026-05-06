@@ -494,6 +494,16 @@ class WikiConfig:
             "UNSLOTH_WIKI_ENGINE_LLM_RERANK_ENABLED", True
         )
     )
+    ranking_llm_rerank_include_analysis_pages: bool = field(
+        default_factory = lambda: _env_flag(
+            "UNSLOTH_WIKI_ENGINE_LLM_RERANK_INCLUDE_ANALYSIS_PAGES", True
+        )
+    )
+    ranking_llm_rerank_min_candidates: int = field(
+        default_factory = lambda: _env_int(
+            "UNSLOTH_WIKI_ENGINE_LLM_RERANK_MIN_CANDIDATES", 3, minimum = 1
+        )
+    )
     ranking_llm_rerank_candidates: int = field(
         default_factory = lambda: _env_int(
             "UNSLOTH_WIKI_ENGINE_LLM_RERANK_CANDIDATES", 32, minimum = 3
@@ -538,6 +548,11 @@ class WikiConfig:
         default_factory = lambda: _env_flag(
             "UNSLOTH_WIKI_INDEX_INCLUDE_SOURCE_PAGES",
             _env_flag("UNSLOTH_WIKI_RAG_INCLUDE_SOURCE_PAGES", True),
+        )
+    )
+    index_include_analysis_pages: bool = field(
+        default_factory = lambda: _env_flag(
+            "UNSLOTH_WIKI_INDEX_INCLUDE_ANALYSIS_PAGES", True
         )
     )
     index_llm_title_on_rebuild: bool = field(
@@ -1042,6 +1057,20 @@ class LLMWikiEngine:
                         len(chunk_items),
                     )
 
+        planned_source_chars = int(chunk_plan.get("source_chars", len(source_text)))
+        planned_chunk_count = max(1, len(chunk_items))
+        # Approximate fanout for chunked ingest flow:
+        # 1x base source extraction + Nx chunk extraction + Nx chunk query + 1x chunk-merge.
+        approx_llm_calls = 2 + (2 * planned_chunk_count)
+        logger.info(
+            "WIKI_CHUNK_PLAN source=%s source_chars=%d context_window_chars=%d chunk_count=%d approx_llm_calls=%d",
+            source_title,
+            planned_source_chars,
+            effective_context_window_chars,
+            planned_chunk_count,
+            approx_llm_calls,
+        )
+
         chunk_source_pages: List[str] = []
         chunk_analysis_pages: List[str] = []
         failed_chunks: List[Dict[str, Any]] = []
@@ -1227,6 +1256,122 @@ class LLMWikiEngine:
             "stale_chunk_analysis_pages_removed": stale_chunk_analysis_pages_removed,
         }
 
+    def _persist_query_payload(self, payload: Dict[str, Any]) -> Optional[str]:
+        question = str(payload.get("question", "")).strip()
+        if not question:
+            return None
+
+        answer = str(payload.get("answer", ""))
+        llm_answer = str(payload.get("llm_answer", ""))
+        used_extractive_fallback = bool(payload.get("used_extractive_fallback", False))
+
+        low_quality_reason_raw = payload.get("low_quality_reason")
+        low_quality_reason = (
+            str(low_quality_reason_raw).strip()
+            if low_quality_reason_raw is not None
+            else None
+        )
+
+        effective_query_context_max_chars = int(
+            payload.get("query_context_max_chars", self.cfg.query_context_max_chars)
+        )
+        ranked_count = int(payload.get("ranked_count", 0))
+
+        used_pages: List[Tuple[str, float]] = []
+        used_pages_raw = payload.get("used_pages", [])
+        if isinstance(used_pages_raw, list):
+            for item in used_pages_raw:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    rel_path = str(item[0]).strip()
+                    if not rel_path:
+                        continue
+                    try:
+                        score = float(item[1])
+                    except Exception:
+                        score = 0.0
+                    used_pages.append((rel_path, score))
+
+        if not used_pages:
+            return None
+
+        compact_question = self._compact_saved_question(question)
+        slug = self._build_unique_analysis_slug(
+            question,
+            used_pages,
+            llm_answer = llm_answer or answer,
+        )
+        rel = f"analysis/{slug}"
+        p = self.analysis_dir / f"{slug}.md"
+        mode = "extractive-fallback" if used_extractive_fallback else "llm"
+        fallback_block = ""
+        if used_extractive_fallback:
+            preview = llm_answer[:1200].replace("```", "` ` `")
+            fallback_block = (
+                "\n## Fallback Reason\n"
+                f"{low_quality_reason or 'low_quality'}\n\n"
+                "## LLM Raw Answer Preview\n"
+                "```text\n"
+                f"{preview}\n"
+                "```\n"
+            )
+
+        retrieval_lines = [
+            "## Retrieval Diagnostics",
+            f"- ranking_link_depth: {self.cfg.ranking_link_depth}",
+            f"- ranking_link_fanout: {self.cfg.ranking_link_fanout}",
+            f"- ranking_link_llm_selector_enabled: {self.cfg.ranking_link_llm_selector_enabled}",
+            f"- ranking_link_llm_selector_max_candidates: {self.cfg.ranking_link_llm_selector_max_candidates}",
+            f"- llm_rerank_enabled: {self.cfg.ranking_llm_rerank_enabled}",
+            f"- llm_rerank_include_analysis_seed_pages: {self.cfg.ranking_llm_rerank_include_analysis_pages}",
+            f"- llm_rerank_min_candidates: {self.cfg.ranking_llm_rerank_min_candidates}",
+            f"- llm_rerank_candidates: {self.cfg.ranking_llm_rerank_candidates}",
+            f"- llm_rerank_top_n: {self.cfg.ranking_llm_rerank_top_n}",
+            f"- ranking_analysis_first: {self.cfg.ranking_analysis_first}",
+            f"- max_context_pages: {self.cfg.max_context_pages}",
+            f"- max_chars_per_page: {self.cfg.max_chars_per_page}",
+            f"- query_context_max_chars: {effective_query_context_max_chars}",
+            f"- pages_ranked: {ranked_count}",
+            f"- pages_used: {len(used_pages)}",
+        ]
+        p.write_text(
+            "# Query Result\n\n"
+            f"## Question\n{compact_question}\n\n"
+            f"## Answer Mode\n{mode}\n\n"
+            f"## Answer\n{answer}\n\n"
+            f"{fallback_block}"
+            + "\n".join(retrieval_lines)
+            + "\n\n"
+            + "## Context Pages\n"
+            + "\n".join([f"- [[{rp[:-3]}]]" for rp, _ in used_pages])
+            + "\n",
+            encoding = "utf-8",
+        )
+        self._append_log(
+            f"## [{self._today()}] query | {question[:100]}\n"
+            f"- Result page: [[{rel}]]\n"
+            f"- Context pages used: {len(used_pages)}\n"
+        )
+        self._rebuild_index()
+        return rel
+
+    def persist_query_probe_result(
+        self,
+        probe_result: Dict[str, Any],
+        question: Optional[str] = None,
+    ) -> Optional[str]:
+        if not isinstance(probe_result, dict):
+            return None
+
+        payload = probe_result.get("_query_probe_payload")
+        if not isinstance(payload, dict):
+            return None
+
+        if question and not payload.get("question"):
+            payload = dict(payload)
+            payload["question"] = str(question)
+
+        return self._persist_query_payload(payload)
+
     def query(
         self,
         question: str,
@@ -1251,13 +1396,38 @@ class LLMWikiEngine:
             effective_keep_preferred_context_full = True
             effective_preferred_context_only = True
 
-        ranked = self._rank_pages(question)
+        preferred_rel: Optional[str] = None
+        preferred_md: Optional[str] = None
+        if effective_preferred_context_page:
+            preferred_rel = (
+                effective_preferred_context_page[:-3]
+                if effective_preferred_context_page.endswith(".md")
+                else effective_preferred_context_page
+            )
+            preferred_md = f"{preferred_rel}.md"
+
+        ranked: List[Tuple[str, float]]
+        if effective_preferred_context_only and preferred_md:
+            preferred_path = self.wiki_dir / preferred_md
+            if preferred_path.exists():
+                # Source-first/preferred-only queries should not pay the full
+                # ranking + LLM selector cost when we already have a concrete page.
+                ranked = [(preferred_md, 1.0)]
+                logger.info(
+                    "WIKI_QUERY_PREFERRED_ONLY source=%s ranking_skipped=true",
+                    preferred_md,
+                )
+            else:
+                ranked = self._rank_pages(question)
+        else:
+            ranked = self._rank_pages(question)
+
         exclude_analysis_pages = not self.cfg.include_analysis_pages_in_query or (
             source_first_query and effective_preferred_context_page is not None
         )
         if exclude_analysis_pages:
             ranked = [item for item in ranked if not item[0].startswith("analysis/")]
-        if not ranked:
+        if not ranked and not (effective_preferred_context_only and preferred_md):
             ranked = self._rank_pages(question)
             if exclude_analysis_pages:
                 ranked = [
@@ -1269,13 +1439,7 @@ class LLMWikiEngine:
             if self.cfg.max_context_pages <= 0
             else ranked[: self.cfg.max_context_pages]
         )
-        if effective_preferred_context_page:
-            preferred_rel = (
-                effective_preferred_context_page[:-3]
-                if effective_preferred_context_page.endswith(".md")
-                else effective_preferred_context_page
-            )
-            preferred_md = f"{preferred_rel}.md"
+        if preferred_md:
             preferred_entry = next(
                 (item for item in ranked if item[0] == preferred_md), None
             )
@@ -1405,64 +1569,20 @@ class LLMWikiEngine:
         if used_extractive_fallback:
             answer = self._extractive_query_answer(question, used_pages)
 
+        probe_payload = {
+            "question": question,
+            "answer": answer,
+            "llm_answer": llm_answer,
+            "used_extractive_fallback": used_extractive_fallback,
+            "low_quality_reason": low_quality_reason,
+            "used_pages": [(rp, score) for rp, score in used_pages],
+            "ranked_count": len(ranked),
+            "query_context_max_chars": effective_query_context_max_chars,
+        }
+
         answer_page = None
         if save_answer:
-            compact_question = self._compact_saved_question(question)
-            slug = self._build_unique_analysis_slug(
-                question,
-                used_pages,
-                llm_answer = llm_answer,
-            )
-            rel = f"analysis/{slug}"
-            p = self.analysis_dir / f"{slug}.md"
-            mode = "extractive-fallback" if used_extractive_fallback else "llm"
-            fallback_block = ""
-            if used_extractive_fallback:
-                preview = llm_answer[:1200].replace("```", "` ` `")
-                fallback_block = (
-                    "\n## Fallback Reason\n"
-                    f"{low_quality_reason}\n\n"
-                    "## LLM Raw Answer Preview\n"
-                    "```text\n"
-                    f"{preview}\n"
-                    "```\n"
-                )
-            retrieval_lines = [
-                "## Retrieval Diagnostics",
-                f"- ranking_link_depth: {self.cfg.ranking_link_depth}",
-                f"- ranking_link_fanout: {self.cfg.ranking_link_fanout}",
-                f"- ranking_link_llm_selector_enabled: {self.cfg.ranking_link_llm_selector_enabled}",
-                f"- ranking_link_llm_selector_max_candidates: {self.cfg.ranking_link_llm_selector_max_candidates}",
-                f"- llm_rerank_enabled: {self.cfg.ranking_llm_rerank_enabled}",
-                f"- llm_rerank_candidates: {self.cfg.ranking_llm_rerank_candidates}",
-                f"- llm_rerank_top_n: {self.cfg.ranking_llm_rerank_top_n}",
-                f"- ranking_analysis_first: {self.cfg.ranking_analysis_first}",
-                f"- max_context_pages: {self.cfg.max_context_pages}",
-                f"- max_chars_per_page: {self.cfg.max_chars_per_page}",
-                f"- query_context_max_chars: {effective_query_context_max_chars}",
-                f"- pages_ranked: {len(ranked)}",
-                f"- pages_used: {len(used_pages)}",
-            ]
-            p.write_text(
-                "# Query Result\n\n"
-                f"## Question\n{compact_question}\n\n"
-                f"## Answer Mode\n{mode}\n\n"
-                f"## Answer\n{answer}\n\n"
-                f"{fallback_block}"
-                + "\n".join(retrieval_lines)
-                + "\n\n"
-                + "## Context Pages\n"
-                + "\n".join([f"- [[{rp[:-3]}]]" for rp, _ in used_pages])
-                + "\n",
-                encoding = "utf-8",
-            )
-            answer_page = rel
-            self._append_log(
-                f"## [{self._today()}] query | {question[:100]}\n"
-                f"- Result page: [[{rel}]]\n"
-                f"- Context pages used: {len(used_pages)}\n"
-            )
-            self._rebuild_index()
+            answer_page = self._persist_query_payload(probe_payload)
 
         return {
             "status": "ok",
@@ -1472,6 +1592,7 @@ class LLMWikiEngine:
             "used_extractive_fallback": used_extractive_fallback,
             "fallback_reason": low_quality_reason,
             "query_context_max_chars": effective_query_context_max_chars,
+            "_query_probe_payload": probe_payload,
         }
 
     def lint(self) -> Dict:
@@ -2712,12 +2833,7 @@ class LLMWikiEngine:
             else bool(repair_answer_links)
         )
 
-        index_links = self._index_links_by_section()
-        candidate_groups = {
-            "sources": index_links.get("Sources", []),
-            "entities": index_links.get("Entities", []),
-            "concepts": index_links.get("Concepts", []),
-        }
+        candidate_groups = self._enrichment_candidate_groups()
 
         max_pages = max(1, int(max_analysis_pages))
         analysis_pages = sorted(self.analysis_dir.glob("*.md"))[:max_pages]
@@ -2856,6 +2972,257 @@ class LLMWikiEngine:
             "non_fallback_refresh": non_fallback_refresh_report,
             "analysis_link_repair": link_repair_report,
             "knowledge_compaction": knowledge_compaction,
+        }
+
+    def _analysis_backlink_targets(self, text: str) -> Set[str]:
+        targets: Set[str] = set()
+        for target in self._extract_link_targets(text):
+            if target.startswith("entities/") or target.startswith("concepts/"):
+                targets.add(target)
+        return targets
+
+    def _normalize_backlink_mention_text(self, text: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    def _analysis_backlink_phrase_usable(self, phrase: str) -> bool:
+        words = [part for part in str(phrase or "").split() if part]
+        if not words:
+            return False
+        if len(words) >= 2:
+            return True
+
+        token = words[0]
+        if token.isdigit() or token in _TERM_STOPWORDS:
+            return False
+        return len(token) >= 4
+
+    def _analysis_backlink_target_phrase_catalog(
+        self,
+        target_pages: List[Tuple[str, Path]],
+    ) -> Dict[str, Dict[str, Set[str]]]:
+        catalog: Dict[str, Dict[str, Set[str]]] = {}
+
+        for target_rel, page_path in target_pages:
+            page_text = page_path.read_text(encoding = "utf-8", errors = "ignore")
+            title = self._merge_candidate_title(page_text, page_path.stem)
+            candidate_phrases = {
+                title,
+                page_path.stem.replace("-", " ").replace("_", " "),
+            }
+
+            raw_phrases: Set[str] = set()
+            term_phrases: Set[str] = set()
+            for candidate in candidate_phrases:
+                normalized_raw = self._normalize_backlink_mention_text(candidate)
+                if self._analysis_backlink_phrase_usable(normalized_raw):
+                    raw_phrases.add(normalized_raw)
+
+                normalized_terms = " ".join(self._tokenize_terms(candidate))
+                if self._analysis_backlink_phrase_usable(normalized_terms):
+                    term_phrases.add(normalized_terms)
+
+            catalog[target_rel] = {
+                "raw": raw_phrases,
+                "terms": term_phrases,
+            }
+
+        return catalog
+
+    def _analysis_backlink_targets_from_mentions(
+        self,
+        text: str,
+        phrase_catalog: Dict[str, Dict[str, Set[str]]],
+    ) -> Set[str]:
+        if not phrase_catalog:
+            return set()
+
+        normalized_raw = self._normalize_backlink_mention_text(text)
+        normalized_terms = " ".join(self._tokenize_terms(text))
+        if not normalized_raw and not normalized_terms:
+            return set()
+
+        padded_raw = f" {normalized_raw} " if normalized_raw else ""
+        padded_terms = f" {normalized_terms} " if normalized_terms else ""
+
+        matches: Set[str] = set()
+        for target_rel, phrase_sets in phrase_catalog.items():
+            raw_phrases = sorted(
+                phrase_sets.get("raw", set()),
+                key = len,
+                reverse = True,
+            )
+            term_phrases = sorted(
+                phrase_sets.get("terms", set()),
+                key = len,
+                reverse = True,
+            )
+
+            if padded_raw and any(f" {phrase} " in padded_raw for phrase in raw_phrases):
+                matches.add(target_rel)
+                continue
+
+            if padded_terms and any(
+                f" {phrase} " in padded_terms for phrase in term_phrases
+            ):
+                matches.add(target_rel)
+
+        return matches
+
+    def refresh_analysis_backlinks(
+        self,
+        dry_run: bool = True,
+        max_analysis_pages: int = 256,
+        max_links_per_page: int = 128,
+    ) -> Dict[str, Any]:
+        max_pages = max(1, int(max_analysis_pages))
+        max_links = max(1, int(max_links_per_page))
+
+        target_pages: List[Tuple[str, Path]] = []
+        for page_path in sorted(self.entities_dir.glob("*.md")):
+            target_pages.append((f"entities/{page_path.stem}", page_path))
+        for page_path in sorted(self.concepts_dir.glob("*.md")):
+            target_pages.append((f"concepts/{page_path.stem}", page_path))
+
+        target_rel_set = {target_rel for target_rel, _ in target_pages}
+        target_phrase_catalog = self._analysis_backlink_target_phrase_catalog(target_pages)
+
+        analysis_pages = sorted(self.analysis_dir.glob("*.md"))[:max_pages]
+        analysis_refs_by_target: Dict[str, Set[str]] = {}
+        link_signals_by_target: Dict[str, Set[str]] = {}
+        signal_counts = {
+            "analysis_link": 0,
+            "analysis_mention": 0,
+            "source_link": 0,
+            "source_mention": 0,
+        }
+        resolved_primary_source_pages = 0
+
+        for page_path in analysis_pages:
+            rel_page = f"analysis/{page_path.stem}"
+            text = page_path.read_text(encoding = "utf-8", errors = "ignore")
+
+            explicit_targets = self._analysis_backlink_targets(text).intersection(
+                target_rel_set
+            )
+            analysis_mention_targets = self._analysis_backlink_targets_from_mentions(
+                text,
+                target_phrase_catalog,
+            ).intersection(target_rel_set)
+
+            source_link_targets: Set[str] = set()
+            source_mention_targets: Set[str] = set()
+            source_page, _source_chars = self._analysis_primary_source_context(text)
+            if source_page and source_page.startswith("sources/"):
+                source_path = self.wiki_dir / f"{source_page}.md"
+                if source_path.exists():
+                    resolved_primary_source_pages += 1
+                    source_text = source_path.read_text(
+                        encoding = "utf-8",
+                        errors = "ignore",
+                    )
+                    source_link_targets = self._analysis_backlink_targets(
+                        source_text
+                    ).intersection(target_rel_set)
+                    source_mention_targets = self._analysis_backlink_targets_from_mentions(
+                        source_text,
+                        target_phrase_catalog,
+                    ).intersection(target_rel_set)
+
+            signal_counts["analysis_link"] += len(explicit_targets)
+            signal_counts["analysis_mention"] += len(analysis_mention_targets)
+            signal_counts["source_link"] += len(source_link_targets)
+            signal_counts["source_mention"] += len(source_mention_targets)
+
+            for signal_name, targets in (
+                ("analysis_link", explicit_targets),
+                ("analysis_mention", analysis_mention_targets),
+                ("source_link", source_link_targets),
+                ("source_mention", source_mention_targets),
+            ):
+                for target in targets:
+                    analysis_refs_by_target.setdefault(target, set()).add(rel_page)
+                    link_signals_by_target.setdefault(target, set()).add(signal_name)
+
+        updated_pages = 0
+        removed_sections = 0
+        linked_target_pages = 0
+        changes: List[Dict[str, Any]] = []
+
+        for target_rel, page_path in target_pages:
+            original_text = page_path.read_text(encoding = "utf-8", errors = "ignore")
+            analysis_refs = sorted(analysis_refs_by_target.get(target_rel, set()))
+            listed_refs = analysis_refs[:max_links]
+
+            if analysis_refs:
+                linked_target_pages += 1
+                section_lines = [f"- [[{rel}]]" for rel in listed_refs]
+                overflow_count = max(0, len(analysis_refs) - len(listed_refs))
+                if overflow_count > 0:
+                    section_lines.append(f"- ... +{overflow_count} more")
+
+                updated_text = self._upsert_bottom_section(
+                    text = original_text,
+                    section_title = "Referenced by Analyses",
+                    section_body = "\n".join(section_lines),
+                )
+            else:
+                had_section = "## Referenced by Analyses" in original_text
+                updated_text = self._remove_markdown_section(
+                    original_text,
+                    "Referenced by Analyses",
+                ).rstrip()
+                if updated_text:
+                    updated_text += "\n"
+                if had_section:
+                    removed_sections += 1
+
+            if updated_text != original_text:
+                updated_pages += 1
+                if not dry_run:
+                    page_path.write_text(updated_text, encoding = "utf-8")
+
+            if analysis_refs or updated_text != original_text:
+                changes.append(
+                    {
+                        "page": target_rel,
+                        "analysis_pages": [f"[[{rel}]]" for rel in listed_refs],
+                        "analysis_pages_total": len(analysis_refs),
+                        "analysis_pages_listed": len(listed_refs),
+                        "removed_section": bool(not analysis_refs and updated_text != original_text),
+                        "link_signals": sorted(link_signals_by_target.get(target_rel, set())),
+                    }
+                )
+
+        if updated_pages > 0 and not dry_run:
+            self._rebuild_index()
+            self._append_log(
+                f"## [{self._today()}] analysis-backlinks | maintenance\n"
+                f"- Scanned analysis pages: {len(analysis_pages)}\n"
+                f"- Target entity/concept pages: {len(target_pages)}\n"
+                f"- Target pages with references: {linked_target_pages}\n"
+                f"- Updated target pages: {updated_pages}\n"
+                f"- Removed stale backlink sections: {removed_sections}\n"
+                f"- Resolved primary source pages: {resolved_primary_source_pages}\n"
+                f"- Signal counts (analysis links / analysis mentions / source links / source mentions): "
+                f"{signal_counts['analysis_link']} / {signal_counts['analysis_mention']} / "
+                f"{signal_counts['source_link']} / {signal_counts['source_mention']}\n"
+                f"- Max links per page: {max_links}\n"
+            )
+
+        return {
+            "status": "ok",
+            "dry_run": bool(dry_run),
+            "scanned_analysis_pages": len(analysis_pages),
+            "target_pages": len(target_pages),
+            "linked_target_pages": linked_target_pages,
+            "updated_pages": updated_pages,
+            "removed_sections": removed_sections,
+            "max_links_per_page": max_links,
+            "resolved_primary_source_pages": resolved_primary_source_pages,
+            "signal_counts": signal_counts,
+            "changes": changes,
         }
 
     def _repair_analysis_maintenance_links(
@@ -5837,11 +6204,34 @@ class LLMWikiEngine:
             ("Analysis", "analysis"),
         ]
         include_sources = bool(self.cfg.index_include_source_pages)
+        include_analysis = bool(self.cfg.index_include_analysis_pages)
+        existing_summary_by_page = self._index_summary_by_page()
+        previous_index_mtime: Optional[float] = None
+        try:
+            if self.index_file.exists():
+                previous_index_mtime = float(self.index_file.stat().st_mtime)
+        except OSError:
+            previous_index_mtime = None
+
+        def _strip_fallback_tag(summary_text: str) -> str:
+            # Existing index lines may already include fallback markers; those are
+            # recomputed from current page text below and must not be duplicated.
+            return re.sub(
+                r"\s+\[(?:fallback(?:-resolved)?[^\]]*)\]\s*$",
+                "",
+                str(summary_text or "").strip(),
+                flags = re.IGNORECASE,
+            ).strip()
+
         out = ["# Index", ""]
         for header, subdir in sections:
             out.append(f"## {header}")
             if subdir == "sources" and not include_sources:
                 out.append("- (omitted by source-exclusion policy)")
+                out.append("")
+                continue
+            if subdir == "analysis" and not include_analysis:
+                out.append("- (omitted by analysis-index policy)")
                 out.append("")
                 continue
 
@@ -5867,7 +6257,29 @@ class LLMWikiEngine:
                     )
                     continue
                 if subdir == "analysis":
-                    summary = self._analysis_index_summary(page_text)
+                    summary = ""
+                    rel_with_ext = f"{rel}.md"
+                    cached_summary = str(
+                        existing_summary_by_page.get(rel_with_ext, "")
+                    ).strip()
+                    can_reuse_cached_summary = bool(cached_summary)
+
+                    try:
+                        page_mtime = float(f.stat().st_mtime)
+                    except OSError:
+                        page_mtime = None
+
+                    if (
+                        can_reuse_cached_summary
+                        and previous_index_mtime is not None
+                        and page_mtime is not None
+                        and page_mtime <= previous_index_mtime
+                    ):
+                        summary = _strip_fallback_tag(cached_summary)
+
+                    if not summary:
+                        summary = self._analysis_index_summary(page_text)
+
                     line = f"- [[{rel}]] - {summary}".rstrip()
                     fallback_tag = self._analysis_index_fallback_tag(page_text)
                     if fallback_tag:
@@ -6555,6 +6967,31 @@ class LLMWikiEngine:
 
         return out
 
+    def _enrichment_candidate_groups(self) -> Dict[str, List[str]]:
+        include_sources = bool(self.cfg.index_include_source_pages)
+        groups: Dict[str, List[str]] = {
+            "sources": [],
+            "entities": [],
+            "concepts": [],
+        }
+
+        for rel in self._all_wiki_pages():
+            if not rel.endswith(".md"):
+                continue
+            normalized = rel[:-3]
+            if normalized.startswith("sources/"):
+                if include_sources:
+                    groups["sources"].append(normalized)
+            elif normalized.startswith("entities/"):
+                groups["entities"].append(normalized)
+            elif normalized.startswith("concepts/"):
+                groups["concepts"].append(normalized)
+
+        for key in groups:
+            groups[key] = sorted(set(groups[key]))
+
+        return groups
+
     def _extract_link_targets(self, text: str) -> Set[str]:
         out: Set[str] = set()
         for link in re.findall(r"\[\[([^\]]+)\]\]", text):
@@ -6690,13 +7127,20 @@ class LLMWikiEngine:
                 for rel, score in candidate_scores.items()
                 if not rel.startswith("sources/")
             }
+        if not self.cfg.ranking_llm_rerank_include_analysis_pages:
+            candidate_scores = {
+                rel: score
+                for rel, score in candidate_scores.items()
+                if not rel.startswith("analysis/")
+            }
 
         filtered_candidates = [
             (rel, score) for rel, score in candidates if rel in candidate_scores
         ]
-        filtered_candidates = self._prioritize_analysis_first(filtered_candidates)
         if not filtered_candidates:
             return []
+
+        filtered_candidates = self._prioritize_analysis_first(filtered_candidates)
 
         effective_context_pages = (
             int(self.cfg.max_context_pages)
@@ -6708,7 +7152,10 @@ class LLMWikiEngine:
             int(self.cfg.ranking_llm_rerank_top_n),
             effective_context_pages,
         )
-        candidate_limit = max(3, min(len(filtered_candidates), candidate_limit))
+        candidate_limit = max(
+            max(1, int(self.cfg.ranking_llm_rerank_min_candidates)),
+            min(len(filtered_candidates), candidate_limit),
+        )
         filtered_candidates = filtered_candidates[:candidate_limit]
         candidate_scores = {rel: score for rel, score in filtered_candidates}
 
@@ -6833,6 +7280,21 @@ class LLMWikiEngine:
         for idx, rel in enumerate(ordered_paths):
             rank_signal = (total - idx) / total
             reranked.append((rel, rank_signal))
+
+        # Expand only from planner-selected pages to avoid breadth-expanding
+        # the entire pre-planner candidate pool.
+        if self.cfg.ranking_link_depth > 0 and reranked:
+            reranked = self._expand_ranked_pages_by_links(
+                reranked,
+                query_terms = self._terms(query),
+                query_text = query,
+            )
+            if not self.cfg.index_include_source_pages:
+                reranked = [
+                    (rel, score)
+                    for rel, score in reranked
+                    if not rel.startswith("sources/")
+                ]
 
         return reranked
 
@@ -7184,6 +7646,25 @@ class LLMWikiEngine:
 
         return f"---\n{frontmatter.rstrip()}\n---\n\n{merged_body.lstrip()}"
 
+    def _upsert_bottom_section(
+        self, text: str, section_title: str, section_body: str
+    ) -> str:
+        frontmatter, body = self._split_frontmatter_block(text)
+        if not frontmatter:
+            frontmatter, body = self._extract_embedded_frontmatter_block(text)
+
+        cleaned = self._remove_markdown_section(body, section_title).rstrip()
+        section_block = f"## {section_title}\n{section_body.rstrip()}\n"
+        if cleaned:
+            merged_body = f"{cleaned}\n\n{section_block}\n"
+        else:
+            merged_body = f"{section_block}\n"
+
+        if not frontmatter:
+            return merged_body
+
+        return f"---\n{frontmatter.rstrip()}\n---\n\n{merged_body.lstrip()}"
+
     def _all_wiki_pages(self) -> List[str]:
         out = []
         for p in self.wiki_dir.rglob("*.md"):
@@ -7255,6 +7736,13 @@ class LLMWikiEngine:
             if index_label:
                 return index_label
 
+            # Compact index mode can intentionally omit analysis entries.
+            # Fall back to analysis summary extraction to avoid generic labels
+            # such as "Query Result" in graph nodes.
+            analysis_summary = self._analysis_index_summary(text).strip()
+            if analysis_summary:
+                return analysis_summary
+
         frontmatter, body = self._split_frontmatter_block(text)
         if frontmatter:
             title_match = re.search(r"(?mi)^title:\s*(.+?)\s*$", frontmatter)
@@ -7285,11 +7773,35 @@ class LLMWikiEngine:
             for rel in pages
             if (self._wiki_graph_kind_for_page(rel) or "") in allowed_kinds
         ]
-        link_graph = self._build_link_graph(graph_pages)
-        outbound = link_graph.get("outbound", {})
-        inbound = link_graph.get("inbound", {})
         graph_page_set = set(graph_pages)
         analysis_index_labels = self._analysis_graph_labels_from_index()
+
+        page_text_by_rel: Dict[str, str] = {}
+        outbound_targets: Dict[str, Set[str]] = {rel: set() for rel in graph_pages}
+        inbound_sources: Dict[str, Set[str]] = {rel: set() for rel in graph_pages}
+
+        for rel in graph_pages:
+            text = (self.wiki_dir / rel).read_text(encoding = "utf-8", errors = "ignore")
+            page_text_by_rel[rel] = text
+
+            raw_targets = self._extract_link_targets(text)
+            if not raw_targets:
+                continue
+
+            for raw_target in raw_targets:
+                normalized_target = self._normalize_wikilink(raw_target)
+                if not normalized_target:
+                    continue
+
+                target_rel = f"{normalized_target}.md"
+                if target_rel not in graph_page_set:
+                    continue
+
+                if target_rel in outbound_targets[rel]:
+                    continue
+
+                outbound_targets[rel].add(target_rel)
+                inbound_sources[target_rel].add(rel)
 
         nodes: List[Dict[str, Any]] = []
         for rel in graph_pages:
@@ -7297,7 +7809,7 @@ class LLMWikiEngine:
             if kind is None:
                 continue
 
-            text = (self.wiki_dir / rel).read_text(encoding = "utf-8", errors = "ignore")
+            text = page_text_by_rel.get(rel, "")
             node_id = rel[:-3] if rel.endswith(".md") else rel
             nodes.append(
                 {
@@ -7308,25 +7820,19 @@ class LLMWikiEngine:
                         text,
                         analysis_index_labels = analysis_index_labels,
                     ),
-                    "inbound_links": len(inbound.get(rel, [])),
-                    "outbound_links": len(outbound.get(rel, [])),
+                    "inbound_links": len(inbound_sources.get(rel, set())),
+                    "outbound_links": len(outbound_targets.get(rel, set())),
                 }
             )
 
-        edge_ids: Set[str] = set()
         edges: List[Dict[str, str]] = []
-        for source_rel, target_rels in outbound.items():
+        for source_rel, target_rels in outbound_targets.items():
             source_id = source_rel[:-3] if source_rel.endswith(".md") else source_rel
-            for target_rel in target_rels:
-                if target_rel not in graph_page_set:
-                    continue
+            for target_rel in sorted(target_rels):
                 target_id = (
                     target_rel[:-3] if target_rel.endswith(".md") else target_rel
                 )
                 edge_id = f"{source_id}->{target_id}"
-                if edge_id in edge_ids:
-                    continue
-                edge_ids.add(edge_id)
                 edges.append({"id": edge_id, "source": source_id, "target": target_id})
 
         kind_order = {"source": 0, "analysis": 1, "entity": 2, "concept": 3}
@@ -7627,6 +8133,28 @@ class LLMWikiEngine:
         scored.sort(key = lambda item: item[1], reverse = True)
         return [(rel, 1.0 / (1.0 + idx)) for idx, (rel, _mtime) in enumerate(scored)]
 
+    def _rank_pages_without_signal(
+        self, pages: Optional[List[str]] = None
+    ) -> List[Tuple[str, float]]:
+        candidate_pages = self._all_wiki_pages() if pages is None else pages
+
+        def _kind_priority(rel: str) -> int:
+            if rel.startswith("sources/"):
+                return 0
+            if rel.startswith("entities/"):
+                return 1
+            if rel.startswith("concepts/"):
+                return 2
+            if rel.startswith("analysis/"):
+                return 3
+            return 4
+
+        ordered = sorted(
+            [rel for rel in candidate_pages if rel not in {"index.md", "log.md"}],
+            key = lambda rel: (_kind_priority(rel), rel),
+        )
+        return [(rel, 1.0 / (1.0 + idx)) for idx, rel in enumerate(ordered)]
+
     def _entity_query_focus_lexical(self, query: str) -> Tuple[Set[str], str]:
         lowered = query.strip().lower()
         patterns = (
@@ -7718,153 +8246,158 @@ class LLMWikiEngine:
         effective_include_sources = bool(
             include_source_pages and self.cfg.index_include_source_pages
         )
+
         if not effective_include_sources:
             all_pages = [p for p in all_pages if not p.startswith("sources/")]
 
-        llm_seed_ranked = self._rank_pages_by_recency(all_pages)
-        if self.cfg.ranking_llm_rerank_enabled and len(llm_seed_ranked) > 1:
-            llm_ranked = self._llm_rerank_candidates(query, llm_seed_ranked)
+        q_terms = self._terms(query)
+
+        entity_focus_terms: Set[str] = set()
+        entity_focus_slug = ""
+        query_phrases: List[str] = []
+        if q_terms:
+            entity_focus_terms, entity_focus_slug = self._entity_query_focus(query)
+
+            for phrase in re.findall(r'"([^"]+)"', query.lower()):
+                normalized = " ".join(self._tokenize_terms(phrase))
+                if normalized:
+                    query_phrases.append(normalized)
+            if entity_focus_slug:
+                query_phrases.append(entity_focus_slug.replace("-", " "))
+            if len(q_terms) <= 5:
+                full_query_phrase = " ".join(self._tokenize_terms(query))
+                if full_query_phrase:
+                    query_phrases.append(full_query_phrase)
+
+            dedup_phrases: List[str] = []
+            seen_phrases = set()
+            for phrase in query_phrases:
+                if len(phrase) < 3:
+                    continue
+                if phrase in seen_phrases:
+                    continue
+                seen_phrases.add(phrase)
+                dedup_phrases.append(phrase)
+            query_phrases = dedup_phrases
+
+        scores: List[Tuple[str, float]] = []
+        if q_terms:
+            for rel in all_pages:
+                if rel in {"index.md", "log.md"}:
+                    continue
+
+                try:
+                    text = (self.wiki_dir / rel).read_text(
+                        encoding = "utf-8",
+                        errors = "ignore",
+                    )
+                except FileNotFoundError:
+                    logger.debug(
+                        "Skipping wiki page that disappeared during ranking: %s",
+                        rel,
+                    )
+                    continue
+                except OSError as exc:
+                    logger.warning(
+                        "Skipping unreadable wiki page during ranking (%s): %s",
+                        rel,
+                        exc,
+                    )
+                    continue
+                text_for_ranking = (
+                    text
+                    if self.cfg.ranking_max_chars <= 0
+                    else text[: self.cfg.ranking_max_chars]
+                )
+                term_counts = self._term_counter(text_for_ranking)
+                page_terms = set(term_counts.keys())
+                if not page_terms and not text_for_ranking.strip():
+                    continue
+
+                matched_terms = q_terms.intersection(page_terms)
+                text_hits = sum(min(2, term_counts.get(term, 0)) for term in matched_terms)
+                text_relevance = text_hits / max(1, len(q_terms))
+
+                rel_norm = (
+                    rel.lower()
+                    .replace("/", " ")
+                    .replace(".md", " ")
+                    .replace("-", " ")
+                    .replace("_", " ")
+                )
+                path_terms = set(self._tokenize_terms(rel_norm))
+                path_overlap = self._overlap_ratio(q_terms, path_terms)
+
+                title_line = ""
+                for raw_line in text.splitlines():
+                    line = raw_line.strip()
+                    if line.startswith("# "):
+                        title_line = line[2:].strip()
+                        break
+                title_terms = set(self._tokenize_terms(title_line))
+                title_overlap = self._overlap_ratio(q_terms, title_terms)
+
+                lowered_text = text_for_ranking.lower()
+                phrase_hits = 0
+                for phrase in query_phrases:
+                    if phrase in lowered_text or phrase in rel_norm:
+                        phrase_hits += 1
+                phrase_boost = (
+                    min(1.0, phrase_hits / max(1, len(query_phrases)))
+                    if query_phrases
+                    else 0.0
+                )
+
+                entity_boost = 0.0
+                if entity_focus_terms:
+                    focus_overlap = self._overlap_ratio(
+                        entity_focus_terms,
+                        path_terms.union(title_terms).union(page_terms),
+                    )
+                    if rel.startswith("entities/"):
+                        # Do not promote unrelated entity pages for person-intent queries.
+                        entity_boost = 0.20 * focus_overlap
+                    else:
+                        entity_boost = 0.06 * focus_overlap
+
+                    if entity_focus_slug and entity_focus_slug in rel:
+                        entity_boost += 0.45
+                    elif rel.startswith("entities/") and focus_overlap >= 0.5:
+                        entity_boost += 0.10
+
+                score = (
+                    (0.55 * text_relevance)
+                    + (0.22 * path_overlap)
+                    + (0.18 * title_overlap)
+                    + (0.20 * phrase_boost)
+                    + entity_boost
+                )
+                if score <= 0:
+                    continue
+                if rel.startswith("analysis/"):
+                    score *= 1.20
+                elif rel.startswith("sources/"):
+                    score *= 0.7
+                scores.append((rel, score))
+
+        if scores:
+            seed_ranked = sorted(scores, key = lambda x: x[1], reverse = True)
+        else:
+            seed_ranked = self._rank_pages_without_signal(all_pages)
+
+        if self.cfg.ranking_llm_rerank_enabled and len(seed_ranked) > 1:
+            llm_ranked = self._llm_rerank_candidates(query, seed_ranked)
             if llm_ranked:
                 return _finalize(llm_ranked, "llm_rerank")
 
-        q_terms = self._terms(query)
         if not q_terms:
-            return _finalize(llm_seed_ranked, "lexical_fallback")
+            return _finalize(seed_ranked, "lexical_fallback")
 
-        entity_focus_terms, entity_focus_slug = self._entity_query_focus(query)
-
-        query_phrases: List[str] = []
-        for phrase in re.findall(r'"([^"]+)"', query.lower()):
-            normalized = " ".join(self._tokenize_terms(phrase))
-            if normalized:
-                query_phrases.append(normalized)
-        if entity_focus_slug:
-            query_phrases.append(entity_focus_slug.replace("-", " "))
-        if len(q_terms) <= 5:
-            full_query_phrase = " ".join(self._tokenize_terms(query))
-            if full_query_phrase:
-                query_phrases.append(full_query_phrase)
-
-        dedup_phrases: List[str] = []
-        seen_phrases = set()
-        for phrase in query_phrases:
-            if len(phrase) < 3:
-                continue
-            if phrase in seen_phrases:
-                continue
-            seen_phrases.add(phrase)
-            dedup_phrases.append(phrase)
-        query_phrases = dedup_phrases
-
-        scores: List[Tuple[str, float]] = []
-        for rel in all_pages:
-            if rel in {"index.md", "log.md"}:
-                continue
-
-            try:
-                text = (self.wiki_dir / rel).read_text(
-                    encoding = "utf-8",
-                    errors = "ignore",
-                )
-            except FileNotFoundError:
-                logger.debug(
-                    "Skipping wiki page that disappeared during ranking: %s",
-                    rel,
-                )
-                continue
-            except OSError as exc:
-                logger.warning(
-                    "Skipping unreadable wiki page during ranking (%s): %s",
-                    rel,
-                    exc,
-                )
-                continue
-            text_for_ranking = (
-                text
-                if self.cfg.ranking_max_chars <= 0
-                else text[: self.cfg.ranking_max_chars]
-            )
-            term_counts = self._term_counter(text_for_ranking)
-            page_terms = set(term_counts.keys())
-            if not page_terms and not text_for_ranking.strip():
-                continue
-
-            matched_terms = q_terms.intersection(page_terms)
-            text_hits = sum(min(2, term_counts.get(term, 0)) for term in matched_terms)
-            text_relevance = text_hits / max(1, len(q_terms))
-
-            rel_norm = (
-                rel.lower()
-                .replace("/", " ")
-                .replace(".md", " ")
-                .replace("-", " ")
-                .replace("_", " ")
-            )
-            path_terms = set(self._tokenize_terms(rel_norm))
-            path_overlap = self._overlap_ratio(q_terms, path_terms)
-
-            title_line = ""
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-                if line.startswith("# "):
-                    title_line = line[2:].strip()
-                    break
-            title_terms = set(self._tokenize_terms(title_line))
-            title_overlap = self._overlap_ratio(q_terms, title_terms)
-
-            lowered_text = text_for_ranking.lower()
-            phrase_hits = 0
-            for phrase in query_phrases:
-                if phrase in lowered_text or phrase in rel_norm:
-                    phrase_hits += 1
-            phrase_boost = (
-                min(1.0, phrase_hits / max(1, len(query_phrases)))
-                if query_phrases
-                else 0.0
-            )
-
-            entity_boost = 0.0
-            if entity_focus_terms:
-                focus_overlap = self._overlap_ratio(
-                    entity_focus_terms,
-                    path_terms.union(title_terms).union(page_terms),
-                )
-                if rel.startswith("entities/"):
-                    # Do not promote unrelated entity pages for person-intent queries.
-                    entity_boost = 0.20 * focus_overlap
-                else:
-                    entity_boost = 0.06 * focus_overlap
-
-                if entity_focus_slug and entity_focus_slug in rel:
-                    entity_boost += 0.45
-                elif rel.startswith("entities/") and focus_overlap >= 0.5:
-                    entity_boost += 0.10
-
-            score = (
-                (0.55 * text_relevance)
-                + (0.22 * path_overlap)
-                + (0.18 * title_overlap)
-                + (0.20 * phrase_boost)
-                + entity_boost
-            )
-            if score <= 0:
-                continue
-            if rel.startswith("analysis/"):
-                score *= 1.20
-            elif rel.startswith("sources/"):
-                score *= 0.7
-            scores.append((rel, score))
-
-        if not scores:
-            ranked = self._rank_pages_by_recency(all_pages)
-        else:
-            ranked = sorted(scores, key = lambda x: x[1], reverse = True)
-            ranked = self._expand_ranked_pages_by_links(
-                ranked,
-                query_terms = q_terms,
-                query_text = query,
-            )
-
+        ranked = self._expand_ranked_pages_by_links(
+            seed_ranked,
+            query_terms = q_terms,
+            query_text = query,
+        )
         return _finalize(ranked, "lexical_fallback")
 
     def _llm_select_link_expansion_targets(
@@ -8007,6 +8540,8 @@ class LLMWikiEngine:
                     encoding = "utf-8", errors = "ignore"
                 )
                 linked_pages = self._extract_existing_links(text, all_pages)
+                fallback_candidates = list(linked_pages)
+                fanout = max(1, int(self.cfg.ranking_link_fanout))
 
                 llm_selected: List[str] = []
                 use_llm_selector = (
@@ -8025,9 +8560,27 @@ class LLMWikiEngine:
                     )
 
                 if llm_selected:
-                    linked_pages = llm_selected[: self.cfg.ranking_link_fanout]
+                    linked_pages = llm_selected[:fanout]
                 else:
-                    linked_pages = []
+                    scored_links: List[Tuple[float, float, int, str]] = []
+                    for idx, target in enumerate(fallback_candidates):
+                        path_overlap = self._overlap_ratio(
+                            query_terms or set(),
+                            set(self._tokenize_terms(target)),
+                        )
+                        scored_links.append(
+                            (
+                                float(ranked_map.get(target, 0.0)),
+                                float(path_overlap),
+                                idx,
+                                target,
+                            )
+                        )
+
+                    scored_links.sort(
+                        key = lambda item: (-item[0], -item[1], item[2], item[3])
+                    )
+                    linked_pages = [item[3] for item in scored_links[:fanout]]
 
                 links_cache[rel] = linked_pages
 

@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 _backend = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _backend)
@@ -53,6 +54,7 @@ from routes.inference import (
     _upstream_server_tools_enabled,
     _upstream_tool_use_nudge,
     _route_wiki_llm_stub,
+    _wants_wiki_structured_json,
     _wiki_llm_available,
 )
 
@@ -540,6 +542,60 @@ class TestOpenAIUpstreamHelpers:
         assert body.get("chat_template_kwargs", {}).get("foo") == "bar"
         assert body.get("chat_template_kwargs", {}).get("enable_thinking") is True
 
+    def test_build_openai_upstream_body_uses_deepseek_thinking_toggle_format(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_BASE_URL",
+            "https://api.deepseek.com/v1",
+        )
+
+        req = ChatCompletionRequest(
+            model = "default",
+            messages = [{"role": "user", "content": "hello"}],
+            stream = False,
+            enable_thinking = False,
+            chat_template_kwargs = {"foo": "bar"},
+        )
+
+        body = _build_openai_upstream_body(req, "deepseek-v4-pro")
+
+        assert body.get("thinking") == {"type": "disabled"}
+        assert body.get("chat_template_kwargs", {}).get("foo") == "bar"
+        assert body.get("chat_template_kwargs", {}).get("enable_thinking") is None
+
+    def test_build_openai_upstream_body_reasoning_content_provider_guard(self, monkeypatch):
+        base_req = ChatCompletionRequest(
+            model = "default",
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": "Final answer",
+                    "reasoning_content": "Internal reasoning",
+                },
+                {"role": "user", "content": "Follow-up"},
+            ],
+            stream = False,
+        )
+
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_BASE_URL",
+            "https://integrate.api.nvidia.com/v1",
+        )
+        non_deepseek_body = _build_openai_upstream_body(base_req, "provider/model")
+        assert "reasoning_content" not in non_deepseek_body["messages"][0]
+
+        monkeypatch.setattr(
+            inference_routes,
+            "_LLM_UPSTREAM_BASE_URL",
+            "https://api.deepseek.com/v1",
+        )
+        deepseek_body = _build_openai_upstream_body(base_req, "deepseek-v4-pro")
+        assert deepseek_body["messages"][0].get("reasoning_content") == "Internal reasoning"
+
     def test_upstream_tool_nudge_skips_tools_for_greetings(self):
         nudge = _upstream_tool_use_nudge(
             "meta/llama-3.3-70b-instruct",
@@ -753,6 +809,88 @@ class TestOpenAIUpstreamHelpers:
         assert "enable_thinking" not in observed_body
         assert observed_body.get("reasoning_effort") == "high"
         assert "chat_template_kwargs" not in observed_body
+        assert int(observed_body.get("max_tokens") or 0) >= 2000
+
+    def test_wants_wiki_structured_json_is_case_insensitive_and_phrase_flexible(self):
+        assert _wants_wiki_structured_json("Return strict JSON with keys: summary")
+        assert _wants_wiki_structured_json("return STRICT json only with this schema:")
+        assert _wants_wiki_structured_json("You are a JSON repair assistant.")
+        assert not _wants_wiki_structured_json("Summarize this source in bullets.")
+
+    def test_route_wiki_llm_stub_treats_schema_phrase_as_structured_json(
+        self,
+        monkeypatch,
+    ):
+        observed_body: dict[str, object] = {}
+
+        class _DummyLlama:
+            is_loaded = True
+
+            def generate_chat_completion(self, **kwargs):
+                raise AssertionError("Local GGUF backend should not run for strict JSON extraction")
+
+        class _DummyBackend:
+            active_model_name = "local-model"
+
+            def generate_chat_response(self, **kwargs):
+                raise AssertionError(
+                    "Transformer backend should not run for strict JSON extraction"
+                )
+
+        class _FakeResponse:
+            status_code = 200
+            text = "{\"ok\":true}"
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"keep_missing":[],"related_to_existing":[],"reject":[]}'
+                            }
+                        }
+                    ]
+                }
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json, headers):
+                observed_body.update(json)
+                return _FakeResponse()
+
+        monkeypatch.setattr(inference_routes, "get_llama_cpp_backend", lambda: _DummyLlama())
+        monkeypatch.setattr(inference_routes, "get_inference_backend", lambda: _DummyBackend())
+        monkeypatch.setattr(inference_routes, "_llm_upstream_enabled", lambda: True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_THINKING_ENABLED", True)
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_STYLE", "reasoning_effort")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_REASONING_EFFORT", "high")
+        monkeypatch.setattr(inference_routes, "_WIKI_LLM_PRESERVE_THINKING", False)
+        monkeypatch.setattr(
+            inference_routes,
+            "_llm_upstream_base_url",
+            lambda: "https://example.test/v1",
+        )
+        monkeypatch.setattr(
+            inference_routes,
+            "_resolve_llm_upstream_model",
+            lambda _requested: "dummy/model",
+        )
+        monkeypatch.setattr(inference_routes, "_llm_upstream_headers", lambda: {})
+        monkeypatch.setattr(inference_routes.httpx, "Client", _FakeClient)
+
+        out = _route_wiki_llm_stub(
+            "Return strict JSON only with this schema: keep_missing, related_to_existing, reject."
+        )
+        assert out == '{"keep_missing":[],"related_to_existing":[],"reject":[]}'
+        assert observed_body.get("response_format") == {"type": "json_object"}
         assert int(observed_body.get("max_tokens") or 0) >= 2000
 
     def test_route_wiki_llm_stub_prefers_upstream_for_non_structured_prompts(
@@ -1180,6 +1318,109 @@ class TestHistoryIntentDetection:
 
     def test_remember_without_history_phrase_is_not_history(self):
         assert _looks_like_history_intent("Remember to include caveats") is False
+
+
+class TestManualWikiChatHistorySave:
+    def test_save_chat_history_creates_then_updates_same_thread_file(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        vault = tmp_path / "vault"
+        monkeypatch.setattr(inference_routes, "_WIKI_VAULT_ROOT", vault)
+        monkeypatch.setattr(inference_routes, "_WIKI_WATCHER_ENABLED", True)
+
+        created = inference_routes._save_chat_history_to_route_wiki(
+            thread_id = "thread-abc",
+            thread_title = "Session A",
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "First question"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "reasoning", "text": "Internal thoughts"},
+                        {"type": "text", "text": "Initial answer"},
+                    ],
+                },
+            ],
+        )
+
+        assert created["status"] == "ok"
+        assert created["operation"] == "created"
+        first_path = Path(created["file_path"])
+        assert first_path.exists()
+
+        created_text = first_path.read_text(encoding = "utf-8")
+        assert "Thread ID: thread-abc" in created_text
+        assert "Thread Title: Session A" in created_text
+        assert "### Thinking" in created_text
+        assert "Internal thoughts" in created_text
+        assert "Initial answer" in created_text
+
+        updated = inference_routes._save_chat_history_to_route_wiki(
+            thread_id = "thread-abc",
+            thread_title = "Session A",
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Second question"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Updated answer"}],
+                },
+            ],
+        )
+
+        assert updated["status"] == "ok"
+        assert updated["operation"] == "updated"
+        assert updated["file_path"] == created["file_path"]
+
+        updated_text = first_path.read_text(encoding = "utf-8")
+        assert "Updated answer" in updated_text
+        assert "Second question" in updated_text
+        assert "First question" not in updated_text
+
+    def test_save_chat_history_ingests_immediately_when_watcher_disabled(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        vault = tmp_path / "vault"
+        monkeypatch.setattr(inference_routes, "_WIKI_VAULT_ROOT", vault)
+        monkeypatch.setattr(inference_routes, "_WIKI_WATCHER_ENABLED", False)
+
+        ingested_paths: list[Path] = []
+
+        class _DummyIngestor:
+            def ingest_file(self, file_path, contributor = None):
+                ingested_paths.append(Path(file_path))
+                return "ok"
+
+        monkeypatch.setattr(
+            inference_routes,
+            "_get_route_wiki_components",
+            lambda: (None, _DummyIngestor()),
+        )
+
+        result = inference_routes._save_chat_history_to_route_wiki(
+            thread_id = "thread-def",
+            thread_title = None,
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Answer"}],
+                }
+            ],
+        )
+
+        assert result["status"] == "ok"
+        assert result["ingested_immediately"] is True
+        assert len(ingested_paths) == 1
+        assert ingested_paths[0] == Path(result["file_path"])
 
 
 # =====================================================================

@@ -14,6 +14,8 @@ import type {
   OpenAIChatCompletionsRequest,
   UnloadModelRequest,
   ValidateModelResponse,
+  WikiChatHistorySaveRequest,
+  WikiChatHistorySaveResponse,
 } from "../types/api";
 
 function parseErrorText(status: number, body: unknown): string {
@@ -84,6 +86,17 @@ export async function listLoras(outputsDir?: string): Promise<ListLorasResponse>
 export async function getInferenceStatus(): Promise<InferenceStatusResponse> {
   const response = await authFetch("/api/inference/status");
   return parseJsonOrThrow<InferenceStatusResponse>(response);
+}
+
+export async function saveWikiChatHistory(
+  payload: WikiChatHistorySaveRequest,
+): Promise<WikiChatHistorySaveResponse> {
+  const response = await authFetch("/api/inference/wiki/chat-history/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return parseJsonOrThrow<WikiChatHistorySaveResponse>(response);
 }
 
 export async function loadModel(

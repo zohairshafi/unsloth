@@ -10,7 +10,9 @@ import shutil
 import sys
 import time
 import uuid
+import hashlib
 import inspect
+import contextvars
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -184,10 +186,14 @@ from models.inference import (
     WikiDataGraphEdge,
     WikiIngestRequest,
     WikiIngestResponse,
+    WikiChatHistorySaveRequest,
+    WikiChatHistorySaveResponse,
     WikiEnrichRequest,
     WikiEnrichResponse,
     WikiRetryFallbackRequest,
     WikiRetryFallbackResponse,
+    WikiAnalysisBacklinksRequest,
+    WikiAnalysisBacklinksResponse,
     WikiMergeMaintenanceRequest,
     WikiMergeMaintenanceResponse,
     WikiQueryRequest,
@@ -265,6 +271,268 @@ _TOOL_XML_RE = _re.compile(
 logger = get_logger(__name__)
 
 
+_CHAT_TRACE_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "chat_trace_id",
+    default = None,
+)
+_CHAT_LLM_CALL_SEQ_CTX: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "chat_llm_call_seq",
+    default = 0,
+)
+
+
+def _start_chat_trace() -> str:
+    trace_id = f"chat-{uuid.uuid4().hex[:12]}"
+    _CHAT_TRACE_ID_CTX.set(trace_id)
+    _CHAT_LLM_CALL_SEQ_CTX.set(0)
+    return trace_id
+
+
+def _chat_trace_id() -> str:
+    trace_id = _CHAT_TRACE_ID_CTX.get()
+    return trace_id if trace_id else "chat-unknown"
+
+
+def _next_chat_llm_call_seq() -> int:
+    seq = _CHAT_LLM_CALL_SEQ_CTX.get() + 1
+    _CHAT_LLM_CALL_SEQ_CTX.set(seq)
+    return seq
+
+
+def _rough_token_count(text: str) -> int:
+    return len(_re.findall(r"\S+", str(text or "")))
+
+
+def _active_text_tokenizer() -> Any:
+    try:
+        backend = get_inference_backend()
+        model_name = backend.active_model_name
+        if not model_name:
+            return None
+        model_info = backend.models.get(model_name, {})
+        tokenizer = model_info.get("tokenizer") or model_info.get("processor")
+        return getattr(tokenizer, "tokenizer", tokenizer)
+    except Exception:
+        return None
+
+
+def _token_count_with_tokenizer(tokenizer: Any, text: str) -> Optional[int]:
+    if not text:
+        return 0
+    if tokenizer is None:
+        return None
+
+    try:
+        if hasattr(tokenizer, "encode"):
+            encoded = tokenizer.encode(text, add_special_tokens = False)
+            if isinstance(encoded, list):
+                return len(encoded)
+    except Exception:
+        pass
+
+    try:
+        encoded = tokenizer(
+            text,
+            add_special_tokens = False,
+            return_attention_mask = False,
+            return_tensors = None,
+        )
+        if isinstance(encoded, dict):
+            input_ids = encoded.get("input_ids")
+            if isinstance(input_ids, list):
+                if input_ids and isinstance(input_ids[0], list):
+                    return len(input_ids[0])
+                return len(input_ids)
+    except Exception:
+        pass
+
+    return None
+
+
+def _estimate_text_tokens(text: str) -> tuple[Optional[int], bool]:
+    tokenizer = _active_text_tokenizer()
+    exact = _token_count_with_tokenizer(tokenizer, text)
+    if exact is not None:
+        return exact, True
+    if not text:
+        return 0, False
+    return _rough_token_count(text), False
+
+
+def _estimate_prompt_tokens_from_messages(
+    *,
+    system_prompt: str,
+    chat_messages: list[dict[str, Any]],
+) -> tuple[Optional[int], bool]:
+    tokenizer = _active_text_tokenizer()
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    for item in chat_messages:
+        messages.append(
+            {
+                "role": str(item.get("role") or "user"),
+                "content": str(item.get("content") or ""),
+            }
+        )
+
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            templated = tokenizer.apply_chat_template(
+                messages,
+                tokenize = False,
+                add_generation_prompt = True,
+            )
+            token_count = _token_count_with_tokenizer(tokenizer, str(templated))
+            if token_count is not None:
+                return token_count, True
+        except Exception:
+            pass
+
+    fallback_prompt = "\n".join(
+        f"{msg['role']}: {msg['content']}" for msg in messages
+    )
+    count, precise = _estimate_text_tokens(fallback_prompt)
+    return count, precise
+
+
+def _usage_token_tuple(usage: Any) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    if isinstance(usage, CompletionUsage):
+        return usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+    if isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        try:
+            p = int(prompt_tokens) if prompt_tokens is not None else None
+        except (TypeError, ValueError):
+            p = None
+        try:
+            c = int(completion_tokens) if completion_tokens is not None else None
+        except (TypeError, ValueError):
+            c = None
+        try:
+            t = int(total_tokens) if total_tokens is not None else None
+        except (TypeError, ValueError):
+            t = None
+        return p, c, t
+    return None, None, None
+
+
+def _wants_wiki_structured_json(prompt: str) -> bool:
+    normalized = _re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    if not normalized:
+        return False
+
+    if "json repair assistant" in normalized:
+        return True
+
+    strict_patterns = (
+        "return strict json with keys",
+        "return strict json only with this schema",
+        "return strict json only with schema",
+        "return strict json only",
+        "return strict json",
+        "return exactly one json object",
+    )
+    if any(pattern in normalized for pattern in strict_patterns):
+        return True
+
+    if "strict json" in normalized and ("schema" in normalized or "keys" in normalized):
+        return True
+
+    if (
+        "json object" in normalized
+        and "schema" in normalized
+        and "return" in normalized
+    ):
+        return True
+
+    return False
+
+
+def _classify_wiki_llm_prompt(prompt: str) -> str:
+    prompt_l = str(prompt or "").lower()
+    if "extract structured knowledge from the source" in prompt_l:
+        return "wiki-source-extract"
+    if "merge chunk analyses into one final wiki report" in prompt_l:
+        return "wiki-chunk-merge"
+    if "retrieval planner for a wiki search system" in prompt_l:
+        return "wiki-rerank-planner"
+    if "entity intent parser for wiki retrieval" in prompt_l:
+        return "wiki-entity-intent"
+    if "link expansion selector for wiki retrieval planning" in prompt_l:
+        return "wiki-link-expansion-selector"
+    if "enrichment link selector for wiki analysis maintenance" in prompt_l:
+        return "wiki-enrichment-link-selector"
+    if "web research planner for wiki gap-filling" in prompt_l:
+        return "wiki-web-gap-planner"
+    if "selecting the best external sources for wiki concept gap fill" in prompt_l:
+        return "wiki-web-gap-selector"
+    if "semantic planner for wiki concept maintenance" in prompt_l:
+        return "wiki-semantic-missing-concepts"
+    if "semantic duplicate merge planner for wiki maintenance" in prompt_l:
+        return "wiki-semantic-merge-planner"
+    if "semantic concept merge planner for wiki maintenance" in prompt_l:
+        return "wiki-semantic-concept-merge-planner"
+    if "semantic concept merge writer for wiki maintenance" in prompt_l:
+        return "wiki-semantic-concept-merge-writer"
+    if "generating a concise index title for a wiki analysis page" in prompt_l:
+        return "wiki-index-title"
+    if "json repair assistant" in prompt_l:
+        return "wiki-json-repair"
+    if _wants_wiki_structured_json(prompt_l):
+        return "wiki-structured-json"
+    if "answering from a maintained wiki" in prompt_l:
+        return "wiki-direct-answer"
+    if "entities" in prompt_l and "concepts" in prompt_l and "json" in prompt_l:
+        return "wiki-entity-concept-extract"
+    return "wiki-generic"
+
+
+def _log_chat_llm_call(
+    *,
+    call_name: str,
+    backend_name: str,
+    model_name: Optional[str],
+    duration_seconds: float,
+    prompt_tokens: Optional[int],
+    completion_tokens: Optional[int],
+    total_tokens: Optional[int],
+    tokens_precise: bool,
+    extra: Optional[str] = None,
+) -> None:
+    trace_id = _chat_trace_id()
+    call_seq = _next_chat_llm_call_seq()
+    completion_tokens_per_second: Optional[float] = None
+    if (
+        duration_seconds > 0
+        and completion_tokens is not None
+        and completion_tokens >= 0
+    ):
+        completion_tokens_per_second = round(
+            float(completion_tokens) / float(duration_seconds),
+            3,
+        )
+    logger.info(
+        "CHAT_LLM_CALL trace_id=%s call_seq=%d call=%s backend=%s model=%s duration_ms=%.1f "
+        "prompt_tokens=%s completion_tokens=%s total_tokens=%s completion_tokens_per_second=%s "
+        "tokens_precise=%s extra=%s",
+        trace_id,
+        call_seq,
+        call_name,
+        backend_name,
+        model_name or "unknown",
+        duration_seconds * 1000.0,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        completion_tokens_per_second,
+        tokens_precise,
+        extra or "",
+    )
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -326,16 +594,9 @@ except ValueError:
     _WIKI_AUTO_RETRY_FALLBACK_MAX_PAGES = 24
 _WIKI_QUERY_RUN_COUNT = 0
 _LAST_RAG_DEBUG: dict[str, Any] = {}
-_CHAT_HISTORY_FLUSH_SECONDS = max(
-    0,
-    int(os.getenv("UNSLOTH_WIKI_CHAT_HISTORY_FLUSH_SECONDS", "600")),
-)
 _WIKI_WATCHER_ENABLED = os.getenv(
     "UNSLOTH_WIKI_WATCHER", "true"
 ).strip().lower() not in {"0", "false", "no", "off"}
-_CHAT_HISTORY_PENDING_BLOCKS: list[str] = []
-_CHAT_HISTORY_BUFFER_STARTED_AT: Optional[_datetime.datetime] = None
-_CHAT_HISTORY_LOCK = threading.Lock()
 _PENDING_RAW_INGEST_MIN_INTERVAL_SECONDS = max(
     0,
     int(os.getenv("UNSLOTH_WIKI_PENDING_INGEST_INTERVAL_SECONDS", "45")),
@@ -635,9 +896,7 @@ def _openai_choice_text(choice: Any) -> str:
 
 def _route_wiki_llm_stub(prompt: str) -> str:
     """Best-effort wiki LLM function using whichever model backend is active."""
-    wants_structured_json = (
-        "Return strict JSON with keys:" in prompt or "JSON repair assistant" in prompt
-    )
+    wants_structured_json = _wants_wiki_structured_json(prompt)
     max_tokens = _WIKI_LLM_MAX_TOKENS
     if wants_structured_json:
         # Structured extraction JSON can be longer than normal chat replies.
@@ -647,6 +906,8 @@ def _route_wiki_llm_stub(prompt: str) -> str:
     top_p = 1.0 if wants_structured_json else 0.9
     top_k = 1 if wants_structured_json else 20
     min_p = 0.0
+    call_name = _classify_wiki_llm_prompt(prompt)
+    prompt_tokens_est, prompt_tokens_precise = _estimate_text_tokens(prompt)
     wiki_reasoning_kwargs = _wiki_llm_reasoning_kwargs()
 
     def _normalize_structured_json_text(text: str) -> str:
@@ -736,6 +997,7 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                 attempts.append(_strip_wiki_reasoning_fields(base_body))
 
         for idx, body in enumerate(attempts, start = 1):
+            attempt_started = time.perf_counter()
             try:
                 with httpx.Client(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
                     response = client.post(
@@ -750,6 +1012,17 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                     strict_json,
                     exc,
                 )
+                _log_chat_llm_call(
+                    call_name = f"{call_name}:attempt-{idx}",
+                    backend_name = "upstream",
+                    model_name = upstream_model,
+                    duration_seconds = time.perf_counter() - attempt_started,
+                    prompt_tokens = prompt_tokens_est,
+                    completion_tokens = None,
+                    total_tokens = None,
+                    tokens_precise = prompt_tokens_precise,
+                    extra = f"strict_json={strict_json} status=request_error",
+                )
                 continue
 
             if response.status_code != 200:
@@ -759,6 +1032,19 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                     strict_json,
                     response.status_code,
                     response.text[:240],
+                )
+                _log_chat_llm_call(
+                    call_name = f"{call_name}:attempt-{idx}",
+                    backend_name = "upstream",
+                    model_name = upstream_model,
+                    duration_seconds = time.perf_counter() - attempt_started,
+                    prompt_tokens = prompt_tokens_est,
+                    completion_tokens = None,
+                    total_tokens = None,
+                    tokens_precise = prompt_tokens_precise,
+                    extra = (
+                        f"strict_json={strict_json} status=http_{response.status_code}"
+                    ),
                 )
                 continue
 
@@ -770,6 +1056,17 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                     idx,
                     strict_json,
                     exc,
+                )
+                _log_chat_llm_call(
+                    call_name = f"{call_name}:attempt-{idx}",
+                    backend_name = "upstream",
+                    model_name = upstream_model,
+                    duration_seconds = time.perf_counter() - attempt_started,
+                    prompt_tokens = prompt_tokens_est,
+                    completion_tokens = None,
+                    total_tokens = None,
+                    tokens_precise = prompt_tokens_precise,
+                    extra = "invalid_json_envelope",
                 )
                 continue
 
@@ -787,12 +1084,51 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                     strict_json,
                     sorted([str(k) for k in data.keys()])[:20],
                 )
+                _log_chat_llm_call(
+                    call_name = f"{call_name}:attempt-{idx}",
+                    backend_name = "upstream",
+                    model_name = upstream_model,
+                    duration_seconds = time.perf_counter() - attempt_started,
+                    prompt_tokens = prompt_tokens_est,
+                    completion_tokens = None,
+                    total_tokens = None,
+                    tokens_precise = prompt_tokens_precise,
+                    extra = "status=empty_content",
+                )
                 continue
 
             content = content.strip()
             if strict_json:
                 content = _normalize_structured_json_text(content)
             if content:
+                usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+                    data.get("usage")
+                )
+                completion_est, completion_precise = _estimate_text_tokens(content)
+                prompt_tokens = usage_prompt
+                if prompt_tokens is None:
+                    prompt_tokens = prompt_tokens_est
+                completion_tokens = usage_completion
+                if completion_tokens is None:
+                    completion_tokens = completion_est
+                total_tokens = usage_total
+                if total_tokens is None:
+                    if prompt_tokens is not None and completion_tokens is not None:
+                        total_tokens = prompt_tokens + completion_tokens
+                _log_chat_llm_call(
+                    call_name = f"{call_name}:attempt-{idx}",
+                    backend_name = "upstream",
+                    model_name = upstream_model,
+                    duration_seconds = time.perf_counter() - attempt_started,
+                    prompt_tokens = prompt_tokens,
+                    completion_tokens = completion_tokens,
+                    total_tokens = total_tokens,
+                    tokens_precise = (
+                        usage_prompt is not None and usage_completion is not None
+                    )
+                    or (prompt_tokens_precise and completion_precise),
+                    extra = f"strict_json={strict_json} status=ok",
+                )
                 return content
 
         return ""
@@ -811,6 +1147,7 @@ def _route_wiki_llm_stub(prompt: str) -> str:
     try:
         llama_backend = get_llama_cpp_backend()
         if llama_backend.is_loaded:
+            started = time.perf_counter()
             chunks = llama_backend.generate_chat_completion(
                 messages = [{"role": "user", "content": prompt}],
                 temperature = temp,
@@ -822,8 +1159,45 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                 presence_penalty = 0.0,
                 **wiki_reasoning_kwargs,
             )
-            final = _merge_streamed_text_chunks(chunks)
+            text_chunks: list[str] = []
+            usage_payload = None
+            for event in chunks:
+                if isinstance(event, dict):
+                    if event.get("type") == "metadata":
+                        usage_payload = event.get("usage")
+                    continue
+                if isinstance(event, str):
+                    text_chunks.append(event)
+
+            final = _merge_streamed_text_chunks(text_chunks)
             if final.strip():
+                usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+                    usage_payload
+                )
+                completion_est, completion_precise = _estimate_text_tokens(final)
+                prompt_tokens = usage_prompt
+                if prompt_tokens is None:
+                    prompt_tokens = prompt_tokens_est
+                completion_tokens = usage_completion
+                if completion_tokens is None:
+                    completion_tokens = completion_est
+                total_tokens = usage_total
+                if total_tokens is None:
+                    if prompt_tokens is not None and completion_tokens is not None:
+                        total_tokens = prompt_tokens + completion_tokens
+                _log_chat_llm_call(
+                    call_name = call_name,
+                    backend_name = "gguf",
+                    model_name = getattr(llama_backend, "model_identifier", None),
+                    duration_seconds = time.perf_counter() - started,
+                    prompt_tokens = prompt_tokens,
+                    completion_tokens = completion_tokens,
+                    total_tokens = total_tokens,
+                    tokens_precise = (
+                        usage_prompt is not None and usage_completion is not None
+                    )
+                    or (prompt_tokens_precise and completion_precise),
+                )
                 return final.strip()
     except Exception as exc:
         logger.warning(f"GGUF wiki LLM call failed, falling back: {exc}")
@@ -831,6 +1205,7 @@ def _route_wiki_llm_stub(prompt: str) -> str:
     try:
         backend = get_inference_backend()
         if backend.active_model_name:
+            started = time.perf_counter()
             generate_kwargs = {
                 "messages": [{"role": "user", "content": prompt}],
                 "system_prompt": "",
@@ -852,6 +1227,20 @@ def _route_wiki_llm_stub(prompt: str) -> str:
                 backend.generate_chat_response(**generate_kwargs)
             )
             if out.strip():
+                completion_tokens, completion_precise = _estimate_text_tokens(out)
+                total_tokens = None
+                if prompt_tokens_est is not None and completion_tokens is not None:
+                    total_tokens = prompt_tokens_est + completion_tokens
+                _log_chat_llm_call(
+                    call_name = call_name,
+                    backend_name = "transformer",
+                    model_name = backend.active_model_name,
+                    duration_seconds = time.perf_counter() - started,
+                    prompt_tokens = prompt_tokens_est,
+                    completion_tokens = completion_tokens,
+                    total_tokens = total_tokens,
+                    tokens_precise = prompt_tokens_precise and completion_precise,
+                )
                 return out.strip()
     except Exception as exc:
         logger.warning(f"Transformer wiki LLM call failed, falling back: {exc}")
@@ -1354,61 +1743,283 @@ def _get_route_rag_context(
     return context
 
 
-def _save_chat_history_to_route_wiki(messages: list[dict]) -> None:
-    if not messages:
+def _route_wiki_chat_history_filename(thread_id: str) -> str:
+    raw_thread_id = str(thread_id or "").strip()
+    normalized = _re.sub(r"[^a-zA-Z0-9._-]+", "_", raw_thread_id).strip("._-")
+    if not normalized:
+        normalized = "thread"
+    digest = hashlib.sha1(raw_thread_id.encode("utf-8")).hexdigest()[:10]
+    return f"chat_history_{normalized[:64]}_{digest}.md"
+
+
+def _scrub_wiki_chat_payload(value: Any, *, depth: int = 0) -> Any:
+    if depth > 6:
+        return "[depth-truncated]"
+
+    if isinstance(value, dict):
+        return {
+            str(key): _scrub_wiki_chat_payload(item, depth = depth + 1)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        items = [_scrub_wiki_chat_payload(item, depth = depth + 1) for item in value[:256]]
+        if len(value) > 256:
+            items.append(f"[truncated {len(value) - 256} additional item(s)]")
+        return items
+
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered.startswith("data:image/") or lowered.startswith("data:audio/"):
+            return f"[binary data omitted: {len(value)} chars]"
+
+        sample = value[:2048]
+        looks_base64 = len(value) > 4096 and bool(
+            _re.fullmatch(r"[A-Za-z0-9+/=\s]+", sample)
+        )
+        if looks_base64:
+            return f"[base64-like payload omitted: {len(value)} chars]"
+
+        if len(value) > 20000:
+            return value[:20000] + "\n...[truncated]"
+
+    return value
+
+
+def _stringify_wiki_chat_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("text", "content", "value", "reasoning_content"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+    return ""
+
+
+def _extract_wiki_chat_parts(
+    raw_parts: Any,
+    *,
+    text_blocks: list[str],
+    reasoning_blocks: list[str],
+    structured_parts: list[Any],
+) -> None:
+    if raw_parts is None:
         return
 
-    timestamp = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [f"## Chat Snapshot - {timestamp}\n"]
-    for msg in messages:
-        role = str(msg.get("role", "unknown")).capitalize()
-        content = str(msg.get("content", "")).strip()
-        if content:
-            lines.append(f"### {role}\n{content}\n")
-    block = "\n".join(lines).strip()
+    if isinstance(raw_parts, str):
+        text = raw_parts.strip()
+        if text:
+            text_blocks.append(text)
+        return
 
-    global _CHAT_HISTORY_BUFFER_STARTED_AT
-    now = _datetime.datetime.now()
-    with _CHAT_HISTORY_LOCK:
-        _CHAT_HISTORY_PENDING_BLOCKS.append(block)
-        if _CHAT_HISTORY_BUFFER_STARTED_AT is None:
-            _CHAT_HISTORY_BUFFER_STARTED_AT = now
+    if isinstance(raw_parts, dict):
+        raw_parts = [raw_parts]
 
-        should_flush = _CHAT_HISTORY_FLUSH_SECONDS == 0
-        if (
-            _CHAT_HISTORY_BUFFER_STARTED_AT is not None
-            and not should_flush
-            and (now - _CHAT_HISTORY_BUFFER_STARTED_AT).total_seconds()
-            >= _CHAT_HISTORY_FLUSH_SECONDS
-        ):
-            should_flush = True
+    if not isinstance(raw_parts, list):
+        text = _stringify_wiki_chat_text(raw_parts)
+        if text:
+            text_blocks.append(text)
+        return
 
-        if not should_flush:
-            return
+    for part in raw_parts:
+        if isinstance(part, str):
+            text = part.strip()
+            if text:
+                text_blocks.append(text)
+            continue
 
-        filename = (
-            f"chat_history_{_datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.md"
+        if not isinstance(part, dict):
+            text = _stringify_wiki_chat_text(part)
+            if text:
+                text_blocks.append(text)
+            continue
+
+        part_type = str(part.get("type", "")).strip().lower()
+        part_text = _stringify_wiki_chat_text(part)
+
+        if part_type in {"text", "input_text", "output_text"}:
+            if part_text:
+                text_blocks.append(part_text)
+            continue
+
+        if part_type == "reasoning":
+            if part_text:
+                reasoning_blocks.append(part_text)
+            continue
+
+        if not part_type and part_text:
+            text_blocks.append(part_text)
+            continue
+
+        structured_parts.append(part)
+
+
+def _render_route_wiki_chat_history_markdown(
+    *,
+    thread_id: str,
+    thread_title: Optional[str],
+    messages: list[dict[str, Any]],
+) -> str:
+    saved_at = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header_lines = [
+        "# Chat History",
+        "",
+        f"- Thread ID: {thread_id}",
+        f"- Saved At: {saved_at}",
+        f"- Message Count: {len(messages)}",
+    ]
+    if thread_title:
+        header_lines.insert(3, f"- Thread Title: {thread_title}")
+
+    blocks: list[str] = ["\n".join(header_lines)]
+    for index, message in enumerate(messages, start = 1):
+        role = str(message.get("role", "unknown")).strip().capitalize() or "Unknown"
+        msg_id = str(message.get("id", "")).strip()
+        created_at = str(message.get("created_at", "")).strip()
+
+        text_blocks: list[str] = []
+        reasoning_blocks: list[str] = []
+        structured_parts: list[Any] = []
+        attachment_notes: list[str] = []
+
+        reasoning_content = str(message.get("reasoning_content", "")).strip()
+        if reasoning_content:
+            reasoning_blocks.append(reasoning_content)
+
+        _extract_wiki_chat_parts(
+            message.get("content"),
+            text_blocks = text_blocks,
+            reasoning_blocks = reasoning_blocks,
+            structured_parts = structured_parts,
         )
-        file_path = _WIKI_VAULT_ROOT / "raw" / filename
-        file_path.parent.mkdir(parents = True, exist_ok = True)
-        payload = "# Chat History Batch\n\n" + "\n\n---\n\n".join(
-            _CHAT_HISTORY_PENDING_BLOCKS
-        )
 
-        try:
-            file_path.write_text(payload, encoding = "utf-8")
-            if _WIKI_WATCHER_ENABLED:
-                logger.debug(
-                    "Chat history batch written to raw/ and left for watcher ingest: %s",
-                    file_path,
+        attachments = message.get("attachments")
+        if isinstance(attachments, list):
+            for att_index, attachment in enumerate(attachments, start = 1):
+                if not isinstance(attachment, dict):
+                    continue
+                att_name = str(attachment.get("name", "")).strip()
+                att_type = str(attachment.get("type", "attachment")).strip() or "attachment"
+                label = att_name or f"{att_type}-{att_index}"
+                attachment_notes.append(f"{label} ({att_type})")
+
+                att_content = attachment.get("content")
+                _extract_wiki_chat_parts(
+                    att_content,
+                    text_blocks = text_blocks,
+                    reasoning_blocks = reasoning_blocks,
+                    structured_parts = structured_parts,
                 )
-            else:
-                _, ingestor = _get_route_wiki_components()
-                ingestor.ingest_file(file_path, contributor = "Unsloth Studio")
-            _CHAT_HISTORY_PENDING_BLOCKS.clear()
-            _CHAT_HISTORY_BUFFER_STARTED_AT = None
-        except Exception as exc:
-            logger.warning("Failed to flush buffered chat history: %s", exc)
+
+        msg_lines: list[str] = [f"## Message {index}: {role}"]
+        if msg_id:
+            msg_lines.append(f"- Message ID: {msg_id}")
+        if created_at:
+            msg_lines.append(f"- Created At: {created_at}")
+
+        if text_blocks:
+            msg_lines.extend([
+                "",
+                "### Text",
+                "",
+                "\n\n".join(text_blocks).strip(),
+            ])
+
+        if reasoning_blocks:
+            msg_lines.extend([
+                "",
+                "### Thinking",
+                "",
+                "\n\n".join(reasoning_blocks).strip(),
+            ])
+
+        if attachment_notes:
+            msg_lines.extend([
+                "",
+                "### Attachments",
+            ])
+            msg_lines.extend(f"- {note}" for note in attachment_notes)
+
+        if structured_parts:
+            msg_lines.extend([
+                "",
+                "### Structured Parts",
+                "",
+                "```json",
+                json.dumps(
+                    _scrub_wiki_chat_payload(structured_parts),
+                    indent = 2,
+                    ensure_ascii = True,
+                ),
+                "```",
+            ])
+
+        if len(msg_lines) == 1:
+            msg_lines.extend(["", "_[No serializable content found for this message.]_"])
+
+        blocks.append("\n".join(msg_lines).strip())
+
+    return "\n\n".join(blocks).rstrip() + "\n"
+
+
+def _save_chat_history_to_route_wiki(
+    *,
+    thread_id: str,
+    messages: list[dict[str, Any]],
+    thread_title: Optional[str] = None,
+) -> dict[str, Any]:
+    thread_key = str(thread_id or "").strip()
+    if not thread_key:
+        raise ValueError("thread_id is required")
+    if not messages:
+        raise ValueError("messages must include at least one entry")
+
+    filename = _route_wiki_chat_history_filename(thread_key)
+    file_path = _WIKI_VAULT_ROOT / "raw" / filename
+    file_path.parent.mkdir(parents = True, exist_ok = True)
+
+    existed_before_write = file_path.exists()
+    markdown = _render_route_wiki_chat_history_markdown(
+        thread_id = thread_key,
+        thread_title = thread_title,
+        messages = messages,
+    )
+    file_path.write_text(markdown, encoding = "utf-8")
+
+    ingested_immediately = False
+    if not _WIKI_WATCHER_ENABLED:
+        _, ingestor = _get_route_wiki_components()
+        ingestor.ingest_file(file_path, contributor = "Unsloth Studio")
+        ingested_immediately = True
+
+    operation = "updated" if existed_before_write else "created"
+    try:
+        relative_path = file_path.relative_to(_WIKI_VAULT_ROOT).as_posix()
+    except Exception:
+        relative_path = str(file_path)
+
+    logger.info(
+        "Manual wiki chat history %s for thread=%s path=%s messages=%d watcher_enabled=%s",
+        operation,
+        thread_key,
+        file_path,
+        len(messages),
+        _WIKI_WATCHER_ENABLED,
+    )
+
+    return {
+        "status": "ok",
+        "operation": operation,
+        "thread_id": thread_key,
+        "file_path": str(file_path),
+        "relative_path": relative_path,
+        "message_count": len(messages),
+        "watcher_enabled": _WIKI_WATCHER_ENABLED,
+        "ingested_immediately": ingested_immediately,
+    }
 
 
 # GGUF inference backend (llama-server)
@@ -1655,6 +2266,43 @@ async def wiki_ingest(
     )
 
 
+@router.post("/wiki/chat-history/save", response_model = WikiChatHistorySaveResponse)
+async def wiki_save_chat_history(
+    payload: WikiChatHistorySaveRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Manually persist full thread history into wiki raw/ with overwrite semantics."""
+    try:
+        result = _save_chat_history_to_route_wiki(
+            thread_id = payload.thread_id,
+            thread_title = payload.thread_title,
+            messages = [
+                message.model_dump(exclude_none = True) for message in payload.messages
+            ],
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code = status.HTTP_400_BAD_REQUEST,
+            detail = str(exc),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail = f"Wiki chat history save failed: {exc}",
+        )
+
+    return WikiChatHistorySaveResponse(
+        status = "ok",
+        operation = str(result.get("operation", "updated")),
+        thread_id = str(result.get("thread_id", payload.thread_id)),
+        file_path = str(result.get("file_path", "")),
+        relative_path = str(result.get("relative_path", "")),
+        message_count = int(result.get("message_count", len(payload.messages))),
+        watcher_enabled = bool(result.get("watcher_enabled", _WIKI_WATCHER_ENABLED)),
+        ingested_immediately = bool(result.get("ingested_immediately", False)),
+    )
+
+
 @router.post("/wiki/enrich", response_model = WikiEnrichResponse)
 async def wiki_enrich(
     payload: WikiEnrichRequest,
@@ -1747,6 +2395,44 @@ async def wiki_retry_fallback(
         skipped_no_question = int(report.get("skipped_no_question", 0)),
         errors = [str(item) for item in report.get("errors", [])],
         results = [dict(item) for item in report.get("results", [])],
+    )
+
+
+@router.post(
+    "/wiki/analysis-backlinks",
+    response_model = WikiAnalysisBacklinksResponse,
+)
+async def wiki_analysis_backlinks(
+    payload: WikiAnalysisBacklinksRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Refresh entity/concept backlink sections from analysis-page wikilinks."""
+    manager, _ = _get_route_wiki_components()
+
+    try:
+        report = manager.refresh_analysis_backlinks(
+            dry_run = payload.dry_run,
+            max_analysis_pages = payload.max_analysis_pages,
+            max_links_per_page = payload.max_links_per_page,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail = f"Wiki analysis backlink maintenance failed: {exc}",
+        )
+
+    return WikiAnalysisBacklinksResponse(
+        status = str(report.get("status", "ok")),
+        dry_run = bool(report.get("dry_run", payload.dry_run)),
+        scanned_analysis_pages = int(report.get("scanned_analysis_pages", 0)),
+        target_pages = int(report.get("target_pages", 0)),
+        linked_target_pages = int(report.get("linked_target_pages", 0)),
+        updated_pages = int(report.get("updated_pages", 0)),
+        removed_sections = int(report.get("removed_sections", 0)),
+        max_links_per_page = int(
+            report.get("max_links_per_page", payload.max_links_per_page)
+        ),
+        changes = [dict(item) for item in report.get("changes", [])],
     )
 
 
@@ -2980,8 +3666,6 @@ def _apply_route_rag_history_hooks_to_payload(
                         "RAG produced empty context for %s request",
                         request_label,
                     )
-
-            _save_chat_history_to_route_wiki(chat_messages)
     except Exception as exc:
         logger.warning(
             "Failed to apply %s RAG/wiki history hooks: %s",
@@ -2999,13 +3683,32 @@ def _build_openai_upstream_body(
     body = payload.model_dump(exclude_none = True)
     body["messages"] = _openai_messages_for_passthrough(payload)
     body["model"] = model_name
+    upstream_base = _llm_upstream_base_url().lower()
+    is_deepseek_upstream = "deepseek.com" in upstream_base
+
+    if not is_deepseek_upstream:
+        # Non-DeepSeek providers may reject unknown assistant fields.
+        for message in body["messages"]:
+            if isinstance(message, dict):
+                message.pop("reasoning_content", None)
+
     for field in _UNSLOTH_ONLY_OPENAI_FIELDS:
         body.pop(field, None)
-    if payload.enable_thinking is not None and _llm_upstream_forward_thinking_enabled():
-        existing = body.get("chat_template_kwargs")
-        chat_template_kwargs = existing if isinstance(existing, dict) else {}
-        chat_template_kwargs["enable_thinking"] = bool(payload.enable_thinking)
-        body["chat_template_kwargs"] = chat_template_kwargs
+
+    if payload.enable_thinking is not None:
+        if is_deepseek_upstream:
+            existing_extra = body.get("extra_body")
+            extra_body = existing_extra if isinstance(existing_extra, dict) else {}
+            existing_thinking = extra_body.get("thinking")
+            thinking_cfg = existing_thinking if isinstance(existing_thinking, dict) else {}
+            thinking_cfg["type"] = "enabled" if bool(payload.enable_thinking) else "disabled"
+            extra_body["thinking"] = thinking_cfg
+            body["extra_body"] = extra_body
+        elif _llm_upstream_forward_thinking_enabled():
+            existing = body.get("chat_template_kwargs")
+            chat_template_kwargs = existing if isinstance(existing, dict) else {}
+            chat_template_kwargs["enable_thinking"] = bool(payload.enable_thinking)
+            body["chat_template_kwargs"] = chat_template_kwargs
 
     # OpenAI SDK's extra_body concept: merge arbitrary provider-specific
     # fields into the top-level JSON request for upstream providers.
@@ -3055,11 +3758,14 @@ def _openai_sse_chunks_from_non_streaming_payload(
     message = first_choice.get("message")
     message = message if isinstance(message, dict) else {}
 
-    content = message.get("content")
-    if content is None:
-        content = ""
-    if not isinstance(content, str):
-        content = str(content)
+    reasoning_content = _openai_text_from_content_parts(
+        message.get("reasoning_content")
+    )
+    content = _openai_text_from_content_parts(message.get("content"))
+    if not content:
+        content = _openai_text_from_content_parts(message.get("output_text"))
+    if not content and isinstance(first_choice.get("text"), str):
+        content = str(first_choice.get("text") or "").strip()
 
     finish_reason = first_choice.get("finish_reason")
     if finish_reason not in {"stop", "length"}:
@@ -3079,6 +3785,20 @@ def _openai_sse_chunks_from_non_streaming_payload(
         ],
     )
     lines.append(f"data: {role_chunk.model_dump_json(exclude_none = True)}\n\n")
+
+    if reasoning_content:
+        reasoning_chunk = ChatCompletionChunk(
+            id = completion_id,
+            created = created,
+            model = model,
+            choices = [
+                ChunkChoice(
+                    delta = ChoiceDelta(content = f"<think>{reasoning_content}</think>"),
+                    finish_reason = None,
+                )
+            ],
+        )
+        lines.append(f"data: {reasoning_chunk.model_dump_json(exclude_none = True)}\n\n")
 
     if content:
         content_chunk = ChatCompletionChunk(
@@ -3426,15 +4146,56 @@ async def _openai_upstream_tool_loop_events(
     emitted_any_content = False
     last_tool_name = ""
     last_tool_result = ""
+    tool_loop_call_seq = 0
 
     async def _call_step(tools: Optional[list[dict]], tool_choice: Any = None) -> dict[str, Any]:
+        nonlocal tool_loop_call_seq
+        tool_loop_call_seq += 1
+        call_started = time.perf_counter()
         body = _build_upstream_tool_loop_request_body(
             base_body,
             conversation,
             tools = tools,
             tool_choice = tool_choice,
         )
-        return await _openai_upstream_chat_non_streaming_json_from_body(body)
+        try:
+            parsed = await _openai_upstream_chat_non_streaming_json_from_body(body)
+        except Exception:
+            _log_chat_llm_call(
+                call_name = "chat-upstream-tool-loop-step",
+                backend_name = "upstream",
+                model_name = model_name,
+                duration_seconds = time.perf_counter() - call_started,
+                prompt_tokens = None,
+                completion_tokens = None,
+                total_tokens = None,
+                tokens_precise = False,
+                extra = (
+                    f"loop_step={tool_loop_call_seq} tool_choice={tool_choice} status=error"
+                ),
+            )
+            raise
+
+        usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+            parsed.get("usage")
+        )
+        if usage_total is None:
+            if usage_prompt is not None and usage_completion is not None:
+                usage_total = usage_prompt + usage_completion
+        _log_chat_llm_call(
+            call_name = "chat-upstream-tool-loop-step",
+            backend_name = "upstream",
+            model_name = model_name,
+            duration_seconds = time.perf_counter() - call_started,
+            prompt_tokens = usage_prompt,
+            completion_tokens = usage_completion,
+            total_tokens = usage_total,
+            tokens_precise = (
+                usage_prompt is not None and usage_completion is not None
+            ),
+            extra = f"loop_step={tool_loop_call_seq} tool_choice={tool_choice}",
+        )
+        return parsed
 
     for iteration in range(max_tool_iterations):
         if request is not None and await request.is_disconnected():
@@ -3463,6 +4224,9 @@ async def _openai_upstream_tool_loop_events(
         finish_reason = _valid_finish_reason(choice.get("finish_reason"))
 
         raw_content = message.get("content")
+        reasoning_content = _openai_text_from_content_parts(
+            message.get("reasoning_content")
+        )
         content = _openai_text_from_content_parts(raw_content)
         if not content:
             content = _openai_text_from_content_parts(message.get("output_text"))
@@ -3495,6 +4259,9 @@ async def _openai_upstream_tool_loop_events(
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         conversation.append(assistant_msg)
+
+        if reasoning_content:
+            yield {"type": "content", "text": f"<think>{reasoning_content}</think>"}
 
         if content:
             yield {"type": "content", "text": content}
@@ -3616,6 +4383,7 @@ async def _openai_upstream_tool_loop_events(
 
     finish_reason = _valid_finish_reason(choice.get("finish_reason"))
 
+    reasoning_content = _openai_text_from_content_parts(message.get("reasoning_content"))
     content = _openai_text_from_content_parts(message.get("content"))
     if not content:
         content = _openai_text_from_content_parts(message.get("output_text"))
@@ -3623,6 +4391,8 @@ async def _openai_upstream_tool_loop_events(
         content = str(choice.get("text") or "").strip()
     if auto_heal and content:
         content = _TOOL_XML_RE.sub("", content).strip()
+    if reasoning_content:
+        yield {"type": "content", "text": f"<think>{reasoning_content}</think>"}
     if not content:
         content = _upstream_empty_assistant_fallback(last_tool_name, last_tool_result)
     if content:
@@ -3646,8 +4416,11 @@ async def _openai_upstream_chat_tools_stream(
 ):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    stream_started = time.perf_counter()
 
     async def _stream():
+        final_usage: Optional[CompletionUsage] = None
+        final_status = "ok"
         try:
             first_chunk = ChatCompletionChunk(
                 id = completion_id,
@@ -3714,6 +4487,9 @@ async def _openai_upstream_chat_tools_stream(
                     usage = event.get("usage")
                     timings = event.get("timings")
                     if usage or timings:
+                        final_usage = (
+                            usage if isinstance(usage, CompletionUsage) else None
+                        )
                         usage_chunk = ChatCompletionChunk(
                             id = completion_id,
                             created = created,
@@ -3725,6 +4501,7 @@ async def _openai_upstream_chat_tools_stream(
                         yield f"data: {usage_chunk.model_dump_json(exclude_none = True)}\n\n"
 
                     yield "data: [DONE]\n\n"
+                    final_status = "final_event"
                     return
 
             # Safety fallback if loop exits without explicit final event.
@@ -3741,7 +4518,9 @@ async def _openai_upstream_chat_tools_stream(
             )
             yield f"data: {final_chunk.model_dump_json(exclude_none = True)}\n\n"
             yield "data: [DONE]\n\n"
+            final_status = "loop_without_final_event"
         except HTTPException as exc:
+            final_status = f"http_exception:{exc.status_code}"
             err = {
                 "error": {
                     "message": str(exc.detail),
@@ -3751,6 +4530,7 @@ async def _openai_upstream_chat_tools_stream(
             yield f"data: {json.dumps(err)}\n\n"
         except Exception as exc:
             logger.error("openai upstream server-tools stream error: %s", exc)
+            final_status = f"error:{type(exc).__name__}"
             err = {
                 "error": {
                     "message": f"Failed to run upstream tool loop: {exc}",
@@ -3758,6 +4538,21 @@ async def _openai_upstream_chat_tools_stream(
                 }
             }
             yield f"data: {json.dumps(err)}\n\n"
+        finally:
+            usage_prompt, usage_completion, usage_total = _usage_token_tuple(final_usage)
+            _log_chat_llm_call(
+                call_name = "chat-upstream-tool-loop",
+                backend_name = "upstream",
+                model_name = model_name,
+                duration_seconds = time.perf_counter() - stream_started,
+                prompt_tokens = usage_prompt,
+                completion_tokens = usage_completion,
+                total_tokens = usage_total,
+                tokens_precise = (
+                    usage_prompt is not None and usage_completion is not None
+                ),
+                extra = f"status={final_status}",
+            )
 
     return StreamingResponse(
         _stream(),
@@ -3770,6 +4565,7 @@ async def _openai_upstream_chat_tools_non_streaming(
     payload: ChatCompletionRequest,
     model_name: str,
 ):
+    started = time.perf_counter()
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     final_text_parts: list[str] = []
@@ -3799,6 +4595,18 @@ async def _openai_upstream_chat_tools_non_streaming(
         ],
         usage = final_usage or CompletionUsage(),
     )
+    usage_prompt, usage_completion, usage_total = _usage_token_tuple(final_usage)
+    _log_chat_llm_call(
+        call_name = "chat-upstream-tool-loop",
+        backend_name = "upstream",
+        model_name = model_name,
+        duration_seconds = time.perf_counter() - started,
+        prompt_tokens = usage_prompt,
+        completion_tokens = usage_completion,
+        total_tokens = usage_total,
+        tokens_precise = usage_prompt is not None and usage_completion is not None,
+        extra = "status=non_stream",
+    )
     return JSONResponse(content = response.model_dump())
 
 
@@ -3825,6 +4633,7 @@ async def _openai_upstream_chat_non_streaming_raw(
     target_url = f"{_llm_upstream_base_url()}/chat/completions"
     body = _build_openai_upstream_body(payload, model_name)
     body["stream"] = False
+    started = time.perf_counter()
 
     try:
         async with httpx.AsyncClient(timeout = _LLM_UPSTREAM_TIMEOUT_SECONDS) as client:
@@ -3834,18 +4643,102 @@ async def _openai_upstream_chat_non_streaming_raw(
                 headers = _llm_upstream_headers(),
             )
     except httpx.RequestError as exc:
+        _log_chat_llm_call(
+            call_name = "chat-upstream-non-stream",
+            backend_name = "upstream",
+            model_name = model_name,
+            duration_seconds = time.perf_counter() - started,
+            prompt_tokens = None,
+            completion_tokens = None,
+            total_tokens = None,
+            tokens_precise = False,
+            extra = f"status=request_error detail={type(exc).__name__}",
+        )
         raise HTTPException(
             status_code = status.HTTP_502_BAD_GATEWAY,
             detail = f"Failed to reach upstream model server: {exc}",
         )
 
     if resp.status_code != 200:
+        _log_chat_llm_call(
+            call_name = "chat-upstream-non-stream",
+            backend_name = "upstream",
+            model_name = model_name,
+            duration_seconds = time.perf_counter() - started,
+            prompt_tokens = None,
+            completion_tokens = None,
+            total_tokens = None,
+            tokens_precise = False,
+            extra = f"status=http_{resp.status_code}",
+        )
         raise HTTPException(
             status_code = resp.status_code,
             detail = f"Upstream model server error: {resp.text[:500]}",
         )
 
-    return resp.content
+    raw_content = resp.content
+
+    usage_prompt = None
+    usage_completion = None
+    usage_total = None
+    completion_tokens_est = None
+    completion_tokens_precise = False
+
+    try:
+        parsed = json.loads(raw_content.decode("utf-8"))
+        if isinstance(parsed, dict):
+            usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+                parsed.get("usage")
+            )
+
+            first_choice = (parsed.get("choices") or [{}])[0]
+            content = _openai_choice_text(first_choice)
+            if not content:
+                content = _openai_text_from_content_parts(parsed.get("output_text"))
+            if not content:
+                content = _openai_text_from_content_parts(parsed.get("text"))
+
+            completion_tokens_est, completion_tokens_precise = _estimate_text_tokens(
+                content
+            )
+    except Exception:
+        pass
+
+    prompt_tokens_est = None
+    prompt_tokens_precise = False
+    try:
+        system_prompt, chat_messages, _ = _extract_content_parts(payload.messages)
+        prompt_tokens_est, prompt_tokens_precise = _estimate_prompt_tokens_from_messages(
+            system_prompt = system_prompt,
+            chat_messages = chat_messages,
+        )
+    except Exception:
+        pass
+
+    prompt_tokens = usage_prompt if usage_prompt is not None else prompt_tokens_est
+    completion_tokens = (
+        usage_completion if usage_completion is not None else completion_tokens_est
+    )
+    total_tokens = usage_total
+    if total_tokens is None:
+        if prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
+
+    _log_chat_llm_call(
+        call_name = "chat-upstream-non-stream",
+        backend_name = "upstream",
+        model_name = model_name,
+        duration_seconds = time.perf_counter() - started,
+        prompt_tokens = prompt_tokens,
+        completion_tokens = completion_tokens,
+        total_tokens = total_tokens,
+        tokens_precise = (
+            usage_prompt is not None and usage_completion is not None
+        )
+        or (prompt_tokens_precise and completion_tokens_precise),
+    )
+
+    return raw_content
 
 
 async def _openai_upstream_stream_via_non_streaming(
@@ -3862,6 +4755,7 @@ async def _openai_upstream_chat_stream(
     payload: ChatCompletionRequest,
     model_name: str,
 ):
+    stream_started = time.perf_counter()
     fallback_enabled = _llm_upstream_auto_stream_fallback_enabled(
         payload.upstream_auto_stream_fallback,
     )
@@ -3932,6 +4826,25 @@ async def _openai_upstream_chat_stream(
         try:
             raw_payload = await resp.aread()
             parsed = _parse_openai_non_streaming_payload(raw_payload)
+            usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+                parsed.get("usage")
+            )
+            if usage_total is None:
+                if usage_prompt is not None and usage_completion is not None:
+                    usage_total = usage_prompt + usage_completion
+            _log_chat_llm_call(
+                call_name = "chat-upstream-stream",
+                backend_name = "upstream",
+                model_name = model_name,
+                duration_seconds = time.perf_counter() - stream_started,
+                prompt_tokens = usage_prompt,
+                completion_tokens = usage_completion,
+                total_tokens = usage_total,
+                tokens_precise = (
+                    usage_prompt is not None and usage_completion is not None
+                ),
+                extra = "status=non_sse_fallback",
+            )
             return _openai_streaming_response_from_payload(parsed, model_name)
         finally:
             try:
@@ -3948,19 +4861,43 @@ async def _openai_upstream_chat_stream(
         saw_data_line = False
         saw_done = False
         client_disconnected = False
+        usage_prompt = None
+        usage_completion = None
+        usage_total = None
+        first_data_at: Optional[float] = None
+        final_status = "ok"
         try:
             lines_iter = resp.aiter_lines()
             async for raw_line in lines_iter:
                 if await request.is_disconnected():
                     client_disconnected = True
+                    final_status = "client_disconnected"
                     break
                 if not raw_line:
                     continue
                 if not raw_line.startswith("data: "):
                     continue
                 saw_data_line = True
+                if first_data_at is None:
+                    first_data_at = time.perf_counter()
+
+                payload_line = raw_line[6:].strip()
+                if payload_line and payload_line != "[DONE]":
+                    try:
+                        parsed_line = json.loads(payload_line)
+                        if isinstance(parsed_line, dict):
+                            p, c, t = _usage_token_tuple(parsed_line.get("usage"))
+                            if p is not None:
+                                usage_prompt = p
+                            if c is not None:
+                                usage_completion = c
+                            if t is not None:
+                                usage_total = t
+                    except Exception:
+                        pass
+
                 yield raw_line + "\n\n"
-                if raw_line[6:].strip() == "[DONE]":
+                if payload_line == "[DONE]":
                     saw_done = True
                     break
             if client_disconnected:
@@ -3979,6 +4916,7 @@ async def _openai_upstream_chat_stream(
                         model_name,
                     )
                     parsed = _parse_openai_non_streaming_payload(raw_payload)
+                    final_status = "no_sse_fallback_nonstream"
                     for line in _openai_sse_chunks_from_non_streaming_payload(
                         parsed,
                         model_name,
@@ -3990,6 +4928,7 @@ async def _openai_upstream_chat_stream(
                         "Upstream no-data stream fallback failed: %s",
                         fallback_exc,
                     )
+                    final_status = "no_sse_fallback_failed"
                     err = {
                         "error": {
                             "message": (
@@ -4005,6 +4944,7 @@ async def _openai_upstream_chat_stream(
                 _remember_upstream_stream_thinking_compat(model_name, True)
         except Exception as exc:
             logger.error("openai upstream stream error: %s", exc)
+            final_status = f"stream_error:{type(exc).__name__}"
             if payload.enable_thinking and fallback_enabled and not saw_data_line:
                 _remember_upstream_stream_thinking_compat(model_name, False)
                 logger.warning(
@@ -4018,6 +4958,7 @@ async def _openai_upstream_chat_stream(
                         model_name,
                     )
                     parsed = _parse_openai_non_streaming_payload(raw_payload)
+                    final_status = "stream_error_fallback_nonstream"
                     for line in _openai_sse_chunks_from_non_streaming_payload(
                         parsed,
                         model_name,
@@ -4029,6 +4970,7 @@ async def _openai_upstream_chat_stream(
                         "Upstream non-streaming fallback failed: %s",
                         fallback_exc,
                     )
+                    final_status = "stream_error_fallback_failed"
             err = {
                 "error": {
                     "message": f"Failed to stream from upstream model server: {exc}",
@@ -4037,6 +4979,28 @@ async def _openai_upstream_chat_stream(
             }
             yield f"data: {json.dumps(err)}\n\n"
         finally:
+            if usage_total is None:
+                if usage_prompt is not None and usage_completion is not None:
+                    usage_total = usage_prompt + usage_completion
+            ttfb_ms = None
+            if first_data_at is not None:
+                ttfb_ms = (first_data_at - stream_started) * 1000.0
+            _log_chat_llm_call(
+                call_name = "chat-upstream-stream",
+                backend_name = "upstream",
+                model_name = model_name,
+                duration_seconds = time.perf_counter() - stream_started,
+                prompt_tokens = usage_prompt,
+                completion_tokens = usage_completion,
+                total_tokens = usage_total,
+                tokens_precise = (
+                    usage_prompt is not None and usage_completion is not None
+                ),
+                extra = (
+                    f"status={final_status} saw_data={saw_data_line} saw_done={saw_done} "
+                    f"ttfb_ms={round(ttfb_ms, 1) if ttfb_ms is not None else 'na'}"
+                ),
+            )
             if lines_iter is not None:
                 try:
                     await lines_iter.aclose()
@@ -4208,6 +5172,15 @@ async def openai_chat_completions(
     - GGUF models → llama-server via LlamaCppBackend
     - Other models → Unsloth/transformers via InferenceBackend
     """
+    chat_trace_id = _start_chat_trace()
+    logger.info(
+        "CHAT_REQUEST_START trace_id=%s route=/v1/chat/completions stream=%s use_upstream=%s model=%s",
+        chat_trace_id,
+        payload.stream,
+        payload.use_upstream,
+        payload.model,
+    )
+
     llama_backend = get_llama_cpp_backend()
     using_gguf = llama_backend.is_loaded
 
@@ -4568,8 +5541,6 @@ async def openai_chat_completions(
                                 system_prompt = rag_block
                         else:
                             logger.info("RAG produced empty context for GGUF request")
-
-                    _save_chat_history_to_route_wiki(chat_messages)
         except Exception as e:
             logger.warning(f"Failed to apply GGUF RAG/wiki history hooks: {e}")
 
@@ -4702,8 +5673,18 @@ async def openai_chat_completions(
                 )
 
             _tool_sentinel = object()
+            prompt_tokens_est, prompt_tokens_precise = (
+                _estimate_prompt_tokens_from_messages(
+                    system_prompt = system_prompt,
+                    chat_messages = chat_messages,
+                )
+            )
 
             async def gguf_tool_stream():
+                stream_started = time.perf_counter()
+                final_status = "ok"
+                final_cumulative_text = ""
+                _stream_usage = None
                 try:
                     first_chunk = ChatCompletionChunk(
                         id = completion_id,
@@ -4722,11 +5703,11 @@ async def openai_chat_completions(
                     # the event loop stays free for disconnect detection.
                     gen = gguf_generate_with_tools()
                     prev_text = ""
-                    _stream_usage = None
                     _stream_timings = None
                     while True:
                         if await request.is_disconnected():
                             cancel_event.set()
+                            final_status = "client_disconnected"
                             return
 
                         event = await asyncio.to_thread(next, gen, _tool_sentinel)
@@ -4740,6 +5721,7 @@ async def openai_chat_completions(
                             # so the next assistant turn streams cleanly.
                             if not event["text"]:
                                 prev_text = ""
+                                final_cumulative_text = ""
                             # Emit tool status as a custom SSE event
                             # (including empty ones to clear UI badges)
                             status_data = json.dumps(
@@ -4768,6 +5750,7 @@ async def openai_chat_completions(
                         # tags are handled correctly.
                         raw_cumulative = event.get("text", "")
                         clean_cumulative = _TOOL_XML_RE.sub("", raw_cumulative)
+                        final_cumulative_text = clean_cumulative
                         new_text = clean_cumulative[len(prev_text) :]
                         prev_text = clean_cumulative
                         if not new_text:
@@ -4819,12 +5802,14 @@ async def openai_chat_completions(
 
                 except asyncio.CancelledError:
                     cancel_event.set()
+                    final_status = "cancelled"
                     raise
                 except Exception as e:
                     import traceback
 
                     tb = traceback.format_exc()
                     logger.error(f"Error during GGUF tool streaming: {e}\n{tb}")
+                    final_status = f"error:{type(e).__name__}"
                     error_chunk = {
                         "error": {
                             "message": _friendly_error(e),
@@ -4832,6 +5817,41 @@ async def openai_chat_completions(
                         },
                     }
                     yield f"data: {json.dumps(error_chunk)}\n\n"
+                finally:
+                    usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+                        _stream_usage
+                    )
+                    completion_est, completion_precise = _estimate_text_tokens(
+                        final_cumulative_text
+                    )
+                    prompt_tokens = (
+                        usage_prompt
+                        if usage_prompt is not None
+                        else prompt_tokens_est
+                    )
+                    completion_tokens = (
+                        usage_completion
+                        if usage_completion is not None
+                        else completion_est
+                    )
+                    total_tokens = usage_total
+                    if total_tokens is None:
+                        if prompt_tokens is not None and completion_tokens is not None:
+                            total_tokens = prompt_tokens + completion_tokens
+                    _log_chat_llm_call(
+                        call_name = "chat-gguf-tool-loop",
+                        backend_name = "gguf",
+                        model_name = model_name,
+                        duration_seconds = time.perf_counter() - stream_started,
+                        prompt_tokens = prompt_tokens,
+                        completion_tokens = completion_tokens,
+                        total_tokens = total_tokens,
+                        tokens_precise = (
+                            usage_prompt is not None and usage_completion is not None
+                        )
+                        or (prompt_tokens_precise and completion_precise),
+                        extra = f"status={final_status}",
+                    )
 
             return StreamingResponse(
                 gguf_tool_stream(),
@@ -4863,10 +5883,18 @@ async def openai_chat_completions(
             )
 
         _gguf_sentinel = object()
+        prompt_tokens_est, prompt_tokens_precise = _estimate_prompt_tokens_from_messages(
+            system_prompt = system_prompt,
+            chat_messages = chat_messages,
+        )
 
         if payload.stream:
 
             async def gguf_stream_chunks():
+                stream_started = time.perf_counter()
+                final_status = "ok"
+                final_cumulative_text = ""
+                _stream_usage = None
                 try:
                     # First chunk: role
                     first_chunk = ChatCompletionChunk(
@@ -4886,11 +5914,11 @@ async def openai_chat_completions(
                     # the event loop stays free for disconnect detection.
                     gen = gguf_generate()
                     prev_text = ""
-                    _stream_usage = None
                     _stream_timings = None
                     while True:
                         if await request.is_disconnected():
                             cancel_event.set()
+                            final_status = "client_disconnected"
                             return
                         cumulative = await asyncio.to_thread(next, gen, _gguf_sentinel)
                         if cumulative is _gguf_sentinel:
@@ -4910,6 +5938,7 @@ async def openai_chat_completions(
                                     },
                                 )
                             continue
+                        final_cumulative_text = cumulative
                         new_text = cumulative[len(prev_text) :]
                         prev_text = cumulative
                         if not new_text:
@@ -4962,9 +5991,11 @@ async def openai_chat_completions(
 
                 except asyncio.CancelledError:
                     cancel_event.set()
+                    final_status = "cancelled"
                     raise
                 except Exception as e:
                     logger.error(f"Error during GGUF streaming: {e}", exc_info = True)
+                    final_status = f"error:{type(e).__name__}"
                     error_chunk = {
                         "error": {
                             "message": _friendly_error(e),
@@ -4972,6 +6003,41 @@ async def openai_chat_completions(
                         },
                     }
                     yield f"data: {json.dumps(error_chunk)}\n\n"
+                finally:
+                    usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+                        _stream_usage
+                    )
+                    completion_est, completion_precise = _estimate_text_tokens(
+                        final_cumulative_text
+                    )
+                    prompt_tokens = (
+                        usage_prompt
+                        if usage_prompt is not None
+                        else prompt_tokens_est
+                    )
+                    completion_tokens = (
+                        usage_completion
+                        if usage_completion is not None
+                        else completion_est
+                    )
+                    total_tokens = usage_total
+                    if total_tokens is None:
+                        if prompt_tokens is not None and completion_tokens is not None:
+                            total_tokens = prompt_tokens + completion_tokens
+                    _log_chat_llm_call(
+                        call_name = "chat-gguf-stream",
+                        backend_name = "gguf",
+                        model_name = model_name,
+                        duration_seconds = time.perf_counter() - stream_started,
+                        prompt_tokens = prompt_tokens,
+                        completion_tokens = completion_tokens,
+                        total_tokens = total_tokens,
+                        tokens_precise = (
+                            usage_prompt is not None and usage_completion is not None
+                        )
+                        or (prompt_tokens_precise and completion_precise),
+                        extra = f"status={final_status}",
+                    )
 
             return StreamingResponse(
                 gguf_stream_chunks(),
@@ -4984,10 +6050,14 @@ async def openai_chat_completions(
             )
         else:
             try:
+                started = time.perf_counter()
                 full_text = ""
+                usage_payload = None
                 for token in gguf_generate():
                     if isinstance(token, dict):
-                        continue  # skip metadata dict in non-streaming path
+                        if token.get("type") == "metadata":
+                            usage_payload = token.get("usage")
+                        continue
                     full_text = token
 
                 response = ChatCompletion(
@@ -5000,6 +6070,35 @@ async def openai_chat_completions(
                             finish_reason = "stop",
                         )
                     ],
+                )
+                usage_prompt, usage_completion, usage_total = _usage_token_tuple(
+                    usage_payload
+                )
+                completion_est, completion_precise = _estimate_text_tokens(full_text)
+                prompt_tokens = (
+                    usage_prompt if usage_prompt is not None else prompt_tokens_est
+                )
+                completion_tokens = (
+                    usage_completion
+                    if usage_completion is not None
+                    else completion_est
+                )
+                total_tokens = usage_total
+                if total_tokens is None:
+                    if prompt_tokens is not None and completion_tokens is not None:
+                        total_tokens = prompt_tokens + completion_tokens
+                _log_chat_llm_call(
+                    call_name = "chat-gguf-non-stream",
+                    backend_name = "gguf",
+                    model_name = model_name,
+                    duration_seconds = time.perf_counter() - started,
+                    prompt_tokens = prompt_tokens,
+                    completion_tokens = completion_tokens,
+                    total_tokens = total_tokens,
+                    tokens_precise = (
+                        usage_prompt is not None and usage_completion is not None
+                    )
+                    or (prompt_tokens_precise and completion_precise),
                 )
                 return JSONResponse(content = response.model_dump())
 
@@ -5068,11 +6167,18 @@ async def openai_chat_completions(
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    prompt_tokens_est, prompt_tokens_precise = _estimate_prompt_tokens_from_messages(
+        system_prompt = system_prompt,
+        chat_messages = chat_messages,
+    )
 
     # ── Streaming response ────────────────────────────────────────
     if payload.stream:
 
         async def stream_chunks():
+            stream_started = time.perf_counter()
+            final_status = "ok"
+            final_cumulative_text = ""
             try:
                 first_chunk = ChatCompletionChunk(
                     id = completion_id,
@@ -5107,7 +6213,9 @@ async def openai_chat_completions(
                     if await request.is_disconnected():
                         cancel_event.set()
                         backend.reset_generation_state()
+                        final_status = "client_disconnected"
                         return
+                    final_cumulative_text = cumulative
                     new_text = cumulative[len(prev_text) :]
                     prev_text = cumulative
                     if not new_text:
@@ -5142,10 +6250,12 @@ async def openai_chat_completions(
             except asyncio.CancelledError:
                 cancel_event.set()
                 backend.reset_generation_state()
+                final_status = "cancelled"
                 raise
             except Exception as e:
                 backend.reset_generation_state()
                 logger.error(f"Error during OpenAI streaming: {e}", exc_info = True)
+                final_status = f"error:{type(e).__name__}"
                 error_chunk = {
                     "error": {
                         "message": _friendly_error(e),
@@ -5153,6 +6263,24 @@ async def openai_chat_completions(
                     },
                 }
                 yield f"data: {json.dumps(error_chunk)}\n\n"
+            finally:
+                completion_tokens, completion_precise = _estimate_text_tokens(
+                    final_cumulative_text
+                )
+                total_tokens = None
+                if prompt_tokens_est is not None and completion_tokens is not None:
+                    total_tokens = prompt_tokens_est + completion_tokens
+                _log_chat_llm_call(
+                    call_name = "chat-transformer-stream",
+                    backend_name = "transformer",
+                    model_name = model_name,
+                    duration_seconds = time.perf_counter() - stream_started,
+                    prompt_tokens = prompt_tokens_est,
+                    completion_tokens = completion_tokens,
+                    total_tokens = total_tokens,
+                    tokens_precise = prompt_tokens_precise and completion_precise,
+                    extra = f"status={final_status}",
+                )
 
         return StreamingResponse(
             stream_chunks(),
@@ -5167,6 +6295,7 @@ async def openai_chat_completions(
     # ── Non-streaming response ────────────────────────────────────
     else:
         try:
+            started = time.perf_counter()
             full_text = ""
             for token in generate():
                 full_text = token
@@ -5181,6 +6310,20 @@ async def openai_chat_completions(
                         finish_reason = "stop",
                     )
                 ],
+            )
+            completion_tokens, completion_precise = _estimate_text_tokens(full_text)
+            total_tokens = None
+            if prompt_tokens_est is not None and completion_tokens is not None:
+                total_tokens = prompt_tokens_est + completion_tokens
+            _log_chat_llm_call(
+                call_name = "chat-transformer-non-stream",
+                backend_name = "transformer",
+                model_name = model_name,
+                duration_seconds = time.perf_counter() - started,
+                prompt_tokens = prompt_tokens_est,
+                completion_tokens = completion_tokens,
+                total_tokens = total_tokens,
+                tokens_precise = prompt_tokens_precise and completion_precise,
             )
             return JSONResponse(content = response.model_dump())
 

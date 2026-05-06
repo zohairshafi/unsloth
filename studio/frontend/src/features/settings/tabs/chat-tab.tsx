@@ -10,6 +10,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Switch } from "@/components/ui/switch";
+import { useChatRuntimeStore } from "@/features/chat/stores/chat-runtime-store";
 import {
   clearAllChats,
   countAllChats,
@@ -22,6 +24,8 @@ import { SettingsRow } from "../components/settings-row";
 import { SettingsSection } from "../components/settings-section";
 
 export function ChatTab() {
+  const autoTitle = useChatRuntimeStore((s) => s.autoTitle);
+  const setAutoTitle = useChatRuntimeStore((s) => s.setAutoTitle);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [count, setCount] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -59,6 +63,15 @@ export function ChatTab() {
           Manage your chat history stored on this device.
         </p>
       </header>
+
+      <SettingsSection title="Defaults">
+        <SettingsRow
+          label="Auto-title new chats"
+          description="Generate a short title from the first message."
+        >
+          <Switch checked={autoTitle} onCheckedChange={setAutoTitle} />
+        </SettingsRow>
+      </SettingsSection>
 
       <SettingsSection title="Data">
         <SettingsRow
