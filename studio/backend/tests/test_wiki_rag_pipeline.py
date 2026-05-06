@@ -911,6 +911,84 @@ def test_manager_retrieve_context_returns_snippets(tmp_path: Path):
     )
 
 
+def test_rank_pages_type_mix_reserves_entity_and_concept_slots(tmp_path: Path):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(
+            vault_root = tmp_path,
+            ranking_llm_rerank_enabled = False,
+            ranking_link_depth = 0,
+            ranking_analysis_first = True,
+            ranking_type_mix_enabled = True,
+            ranking_type_mix_window_pages = 8,
+            ranking_type_mix_analysis_ratio = 0.60,
+            ranking_type_mix_entity_ratio = 0.20,
+            ranking_type_mix_concept_ratio = 0.20,
+        ),
+        llm_fn = lambda _prompt: "{}",
+    )
+
+    query_terms = "graph optimization shortest path attack"
+
+    for idx in range(8):
+        (engine.analysis_dir / f"analysis-{idx}.md").write_text(
+            f"# Analysis {idx}\n\n{query_terms} evidence and derivation details.\n",
+            encoding = "utf-8",
+        )
+
+    (engine.entities_dir / "grasp.md").write_text(
+        f"# GRASP\n\nEntity page about {query_terms}.\n",
+        encoding = "utf-8",
+    )
+    (engine.concepts_dir / "shortest-path-attacks.md").write_text(
+        f"# Shortest Path Attacks\n\nConcept page about {query_terms}.\n",
+        encoding = "utf-8",
+    )
+
+    ranked, ranking_mode = engine._rank_pages(query_terms, return_mode = True)
+    top_window = [rel for rel, _score in ranked[:8]]
+
+    assert ranking_mode == "lexical_fallback"
+    assert any(rel.startswith("entities/") for rel in top_window)
+    assert any(rel.startswith("concepts/") for rel in top_window)
+
+
+def test_rank_pages_type_mix_disabled_keeps_analysis_first_behavior(tmp_path: Path):
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(
+            vault_root = tmp_path,
+            ranking_llm_rerank_enabled = False,
+            ranking_link_depth = 0,
+            ranking_analysis_first = True,
+            ranking_type_mix_enabled = False,
+            ranking_type_mix_window_pages = 8,
+        ),
+        llm_fn = lambda _prompt: "{}",
+    )
+
+    query_terms = "graph optimization shortest path attack"
+
+    for idx in range(8):
+        (engine.analysis_dir / f"analysis-{idx}.md").write_text(
+            f"# Analysis {idx}\n\n{query_terms} evidence and derivation details.\n",
+            encoding = "utf-8",
+        )
+
+    (engine.entities_dir / "grasp.md").write_text(
+        f"# GRASP\n\nEntity page about {query_terms}.\n",
+        encoding = "utf-8",
+    )
+    (engine.concepts_dir / "shortest-path-attacks.md").write_text(
+        f"# Shortest Path Attacks\n\nConcept page about {query_terms}.\n",
+        encoding = "utf-8",
+    )
+
+    ranked, ranking_mode = engine._rank_pages(query_terms, return_mode = True)
+    top_window = [rel for rel, _score in ranked[:8]]
+
+    assert ranking_mode == "lexical_fallback"
+    assert all(rel.startswith("analysis/") for rel in top_window)
+
+
 def test_log_entries_include_hour_minute_timestamp(tmp_path: Path):
     engine = LLMWikiEngine(cfg = WikiConfig(vault_root = tmp_path), llm_fn = lambda _: "{}")
 
@@ -1527,6 +1605,41 @@ def test_rank_pages_llm_rerank_reorders_candidates(tmp_path: Path):
     ranked_paths = [rel for rel, _ in ranked]
 
     assert ranked_paths[:2] == ["sources/beta.md", "sources/alpha.md"]
+
+
+def test_rank_pages_semantic_first_then_lexical_fallback(tmp_path: Path):
+    calls: list[str] = []
+
+    def _llm(prompt: str) -> str:
+        if "retrieval planner for a wiki search system" in prompt:
+            calls.append("rerank")
+            return "not-json"
+        return "{}"
+
+    engine = LLMWikiEngine(
+        cfg = WikiConfig(vault_root = tmp_path),
+        llm_fn = _llm,
+    )
+    engine.cfg.ranking_llm_rerank_enabled = True
+    engine.cfg.ranking_link_depth = 0
+
+    alpha_page = tmp_path / "wiki" / "sources" / "alpha.md"
+    beta_page = tmp_path / "wiki" / "sources" / "beta.md"
+    alpha_page.write_text(
+        "# Alpha\n\nalpha retrieval anchor evidence\n",
+        encoding = "utf-8",
+    )
+    beta_page.write_text(
+        "# Beta\n\nunrelated content\n",
+        encoding = "utf-8",
+    )
+
+    ranked, ranking_mode = engine._rank_pages("alpha retrieval anchor", return_mode = True)
+    ranked_paths = [rel for rel, _score in ranked]
+
+    assert "rerank" in calls
+    assert ranking_mode == "lexical_fallback"
+    assert ranked_paths[0] == "sources/alpha.md"
 
 
 def test_rank_pages_llm_rerank_prioritizes_analysis_pages(tmp_path: Path):

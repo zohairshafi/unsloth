@@ -534,6 +534,40 @@ class WikiConfig:
             "UNSLOTH_WIKI_ENGINE_RANKING_ANALYSIS_FIRST", True
         )
     )
+    ranking_type_mix_enabled: bool = field(
+        default_factory = lambda: _env_flag(
+            "UNSLOTH_WIKI_ENGINE_RANKING_TYPE_MIX_ENABLED", True
+        )
+    )
+    ranking_type_mix_window_pages: int = field(
+        default_factory = lambda: _env_int(
+            "UNSLOTH_WIKI_ENGINE_RANKING_TYPE_MIX_WINDOW_PAGES", 24, minimum = 1
+        )
+    )
+    ranking_type_mix_analysis_ratio: float = field(
+        default_factory = lambda: _env_float(
+            "UNSLOTH_WIKI_ENGINE_RANKING_TYPE_MIX_ANALYSIS_RATIO",
+            0.60,
+            minimum = 0.0,
+            maximum = 1.0,
+        )
+    )
+    ranking_type_mix_entity_ratio: float = field(
+        default_factory = lambda: _env_float(
+            "UNSLOTH_WIKI_ENGINE_RANKING_TYPE_MIX_ENTITY_RATIO",
+            0.20,
+            minimum = 0.0,
+            maximum = 1.0,
+        )
+    )
+    ranking_type_mix_concept_ratio: float = field(
+        default_factory = lambda: _env_float(
+            "UNSLOTH_WIKI_ENGINE_RANKING_TYPE_MIX_CONCEPT_RATIO",
+            0.20,
+            minimum = 0.0,
+            maximum = 1.0,
+        )
+    )
     source_excerpt_max_chars: int = field(
         default_factory = lambda: _env_int(
             "UNSLOTH_WIKI_ENGINE_SOURCE_EXCERPT_MAX_CHARS", 8000
@@ -825,6 +859,22 @@ class WikiConfig:
         self.analysis_force_chunk_max_pages = max(
             0,
             int(self.analysis_force_chunk_max_pages),
+        )
+        self.ranking_type_mix_window_pages = max(
+            1,
+            int(self.ranking_type_mix_window_pages),
+        )
+        self.ranking_type_mix_analysis_ratio = max(
+            0.0,
+            min(1.0, float(self.ranking_type_mix_analysis_ratio)),
+        )
+        self.ranking_type_mix_entity_ratio = max(
+            0.0,
+            min(1.0, float(self.ranking_type_mix_entity_ratio)),
+        )
+        self.ranking_type_mix_concept_ratio = max(
+            0.0,
+            min(1.0, float(self.ranking_type_mix_concept_ratio)),
         )
 
 
@@ -1327,6 +1377,11 @@ class LLMWikiEngine:
             f"- llm_rerank_candidates: {self.cfg.ranking_llm_rerank_candidates}",
             f"- llm_rerank_top_n: {self.cfg.ranking_llm_rerank_top_n}",
             f"- ranking_analysis_first: {self.cfg.ranking_analysis_first}",
+            f"- ranking_type_mix_enabled: {self.cfg.ranking_type_mix_enabled}",
+            f"- ranking_type_mix_window_pages: {self.cfg.ranking_type_mix_window_pages}",
+            f"- ranking_type_mix_analysis_ratio: {self.cfg.ranking_type_mix_analysis_ratio}",
+            f"- ranking_type_mix_entity_ratio: {self.cfg.ranking_type_mix_entity_ratio}",
+            f"- ranking_type_mix_concept_ratio: {self.cfg.ranking_type_mix_concept_ratio}",
             f"- max_context_pages: {self.cfg.max_context_pages}",
             f"- max_chars_per_page: {self.cfg.max_chars_per_page}",
             f"- query_context_max_chars: {effective_query_context_max_chars}",
@@ -7229,7 +7284,7 @@ class LLMWikiEngine:
             f"- Return at most {top_n} pages.\n"
             "- Order best first.\n"
             "- Prefer pages that directly answer the query intent.\n"
-            "- If relevance is comparable, prefer analysis/* pages before other page types.\n"
+            "- If relevance is comparable, include a balanced mix of analysis/*, entities/*, concepts/*, and sources/* when available.\n"
             "- Do not include explanations or markdown fences.\n\n"
             f"QUERY:\n{query}\n\n"
             "ALLOWED_PAGES:\n"
@@ -7308,6 +7363,83 @@ class LLMWikiEngine:
         analysis_ranked = [item for item in ranked if item[0].startswith("analysis/")]
         if not analysis_ranked:
             return ranked
+
+        def _kind(rel: str) -> str:
+            if rel.startswith("analysis/"):
+                return "analysis"
+            if rel.startswith("entities/"):
+                return "entity"
+            if rel.startswith("concepts/"):
+                return "concept"
+            return "other"
+
+        if self.cfg.ranking_type_mix_enabled:
+            mix_window = min(len(ranked), int(self.cfg.ranking_type_mix_window_pages))
+            if mix_window > 0:
+                buckets: Dict[str, List[Tuple[str, float]]] = {
+                    "analysis": [],
+                    "entity": [],
+                    "concept": [],
+                }
+                for item in ranked:
+                    page_kind = _kind(item[0])
+                    if page_kind in buckets:
+                        buckets[page_kind].append(item)
+
+                ratios = {
+                    "analysis": float(self.cfg.ranking_type_mix_analysis_ratio),
+                    "entity": float(self.cfg.ranking_type_mix_entity_ratio),
+                    "concept": float(self.cfg.ranking_type_mix_concept_ratio),
+                }
+
+                ratio_sum = sum(ratios.values())
+                scale = 1.0
+                if ratio_sum > 1.0:
+                    scale = 1.0 / ratio_sum
+
+                targets: Dict[str, int] = {}
+                fractional_parts: List[Tuple[float, str]] = []
+                assigned = 0
+                for kind_name in ("analysis", "entity", "concept"):
+                    desired = (ratios[kind_name] * scale) * mix_window
+                    base = int(desired)
+                    capped = min(base, len(buckets[kind_name]))
+                    targets[kind_name] = capped
+                    assigned += capped
+                    fractional_parts.append((desired - base, kind_name))
+
+                remaining = max(0, mix_window - assigned)
+                for _fractional, kind_name in sorted(
+                    fractional_parts,
+                    key = lambda item: (item[0], item[1] == "analysis"),
+                    reverse = True,
+                ):
+                    if remaining <= 0:
+                        break
+                    available = len(buckets[kind_name]) - targets[kind_name]
+                    if available <= 0:
+                        continue
+                    targets[kind_name] += 1
+                    remaining -= 1
+
+                selected: List[Tuple[str, float]] = []
+                selected_paths: Set[str] = set()
+                for kind_name in ("analysis", "entity", "concept"):
+                    for item in buckets[kind_name][: targets[kind_name]]:
+                        selected.append(item)
+                        selected_paths.add(item[0])
+
+                for item in ranked:
+                    if len(selected) >= mix_window:
+                        break
+                    if item[0] in selected_paths:
+                        continue
+                    selected.append(item)
+                    selected_paths.add(item[0])
+
+                tail = [item for item in ranked if item[0] not in selected_paths]
+                if selected:
+                    return selected + tail
 
         other_ranked = [item for item in ranked if not item[0].startswith("analysis/")]
         return analysis_ranked + other_ranked
@@ -8280,6 +8412,13 @@ class LLMWikiEngine:
                 dedup_phrases.append(phrase)
             query_phrases = dedup_phrases
 
+        semantic_seed = self._rank_pages_without_signal(all_pages)
+
+        if self.cfg.ranking_llm_rerank_enabled and len(semantic_seed) > 1:
+            llm_ranked = self._llm_rerank_candidates(query, semantic_seed)
+            if llm_ranked:
+                return _finalize(llm_ranked, "llm_rerank")
+
         scores: List[Tuple[str, float]] = []
         if q_terms:
             for rel in all_pages:
@@ -8381,20 +8520,15 @@ class LLMWikiEngine:
                 scores.append((rel, score))
 
         if scores:
-            seed_ranked = sorted(scores, key = lambda x: x[1], reverse = True)
+            lexical_ranked = sorted(scores, key = lambda x: x[1], reverse = True)
         else:
-            seed_ranked = self._rank_pages_without_signal(all_pages)
-
-        if self.cfg.ranking_llm_rerank_enabled and len(seed_ranked) > 1:
-            llm_ranked = self._llm_rerank_candidates(query, seed_ranked)
-            if llm_ranked:
-                return _finalize(llm_ranked, "llm_rerank")
+            lexical_ranked = self._rank_pages_without_signal(all_pages)
 
         if not q_terms:
-            return _finalize(seed_ranked, "lexical_fallback")
+            return _finalize(lexical_ranked, "lexical_fallback")
 
         ranked = self._expand_ranked_pages_by_links(
-            seed_ranked,
+            lexical_ranked,
             query_terms = q_terms,
             query_text = query,
         )

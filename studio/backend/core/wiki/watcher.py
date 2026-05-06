@@ -422,6 +422,28 @@ class WikiFileEventHandler(FileSystemEventHandler):
                             run_count,
                             exc,
                         )
+
+                    try:
+                        backlinks_report = (
+                            self.ingestor.wiki_manager.refresh_analysis_backlinks(
+                                dry_run = False
+                            )
+                        )
+                        logger.info(
+                            "Auto wiki analysis-backlinks complete after %d analyses: scanned=%d targets=%d linked=%d updated=%d removed=%d",
+                            run_count,
+                            int(backlinks_report.get("scanned_analysis_pages", 0)),
+                            int(backlinks_report.get("target_pages", 0)),
+                            int(backlinks_report.get("linked_target_pages", 0)),
+                            int(backlinks_report.get("updated_pages", 0)),
+                            int(backlinks_report.get("removed_sections", 0)),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Auto wiki analysis-backlinks failed after %d analyses: %s",
+                            run_count,
+                            exc,
+                        )
             except Exception as exc:
                 logger.warning("Auto wiki analysis failed for %s: %s", file_path, exc)
 

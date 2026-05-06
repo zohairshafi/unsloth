@@ -11,6 +11,7 @@ export {
 } from "./chat-settings-sheet";
 export {
   deleteChatItem,
+  renameChatItem,
   useChatSidebarItems,
 } from "./hooks/use-chat-sidebar-items";
 export { useChatRuntimeStore } from "./stores/chat-runtime-store";

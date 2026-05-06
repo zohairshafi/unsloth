@@ -69,6 +69,7 @@ import { TOUR_OPEN_EVENT } from "@/features/tour";
 import {
   useChatSidebarItems,
   deleteChatItem,
+  renameChatItem,
   useChatRuntimeStore,
   useChatSearchStore,
   ChatSearchDialog,
@@ -360,6 +361,32 @@ export function AppSidebar() {
         search: { new: view.newThreadNonce },
       });
     });
+  }
+
+  async function handleRenameThread(item: Parameters<typeof renameChatItem>[0]) {
+    const currentTitle = String(item.title ?? "").trim();
+    const proposed = window.prompt("Rename conversation", currentTitle);
+    if (proposed === null) {
+      return;
+    }
+
+    const nextTitle = proposed.trim();
+    if (!nextTitle) {
+      toast.error("Title cannot be empty");
+      return;
+    }
+    if (nextTitle === currentTitle) {
+      return;
+    }
+
+    try {
+      await renameChatItem(item, nextTitle);
+      toast.success("Conversation renamed");
+    } catch (error) {
+      toast.error("Failed to rename conversation", {
+        description: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
   }
 
   async function handleWikiLint(): Promise<void> {
@@ -872,17 +899,30 @@ export function AppSidebar() {
                     >
                       <span className="truncate">{item.title}</span>
                     </SidebarMenuButton>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteThread(item);
-                      }}
-                      title="Delete"
-                      className="absolute right-1 top-1/2 -translate-y-1/2 flex size-5 scale-90 items-center justify-center rounded-[10px] text-sidebar-foreground/55 opacity-0 transition-all duration-150 hover:bg-destructive/12 hover:text-destructive group-hover/recent-item:scale-100 group-hover/recent-item:opacity-100"
-                    >
-                      <HugeiconsIcon icon={Delete02Icon} strokeWidth={2} className="size-3.5" />
-                    </button>
+                    <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 scale-90 opacity-0 transition-all duration-150 group-hover/recent-item:scale-100 group-hover/recent-item:opacity-100">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleRenameThread(item);
+                        }}
+                        title="Rename"
+                        className="flex size-5 items-center justify-center rounded-[10px] text-sidebar-foreground/55 transition-colors hover:bg-primary/12 hover:text-primary"
+                      >
+                        <HugeiconsIcon icon={PencilEdit02Icon} strokeWidth={2} className="size-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleDeleteThread(item);
+                        }}
+                        title="Delete"
+                        className="flex size-5 items-center justify-center rounded-[10px] text-sidebar-foreground/55 transition-colors hover:bg-destructive/12 hover:text-destructive"
+                      >
+                        <HugeiconsIcon icon={Delete02Icon} strokeWidth={2} className="size-3.5" />
+                      </button>
+                    </div>
                   </SidebarMenuItem>
                 ))}
               </SidebarMenu>

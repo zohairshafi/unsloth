@@ -540,6 +540,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 _WIKI_VAULT_ROOT = Path(os.getenv("UNSLOTH_WIKI_VAULT", "/tmp/unsloth_wiki"))
 _ROUTE_WIKI_MANAGER: Optional[WikiManager] = None
 _ROUTE_WIKI_INGESTOR: Optional[WikiIngestor] = None
@@ -559,6 +566,26 @@ try:
     )
 except ValueError:
     _RAG_LOG_INJECTED_CONTEXT_MAX_CHARS = 12000
+
+
+def _live_route_rag_limits() -> tuple[int, int, int, bool]:
+    max_pages = _env_int("UNSLOTH_WIKI_RAG_MAX_PAGES", _RAG_MAX_PAGES)
+    max_chars_per_page = _env_int(
+        "UNSLOTH_WIKI_RAG_MAX_CHARS_PER_PAGE", _RAG_MAX_CHARS_PER_PAGE
+    )
+    max_total_chars = _env_int(
+        "UNSLOTH_WIKI_RAG_MAX_TOTAL_CHARS", _RAG_MAX_TOTAL_CHARS
+    )
+    include_source_pages = _env_bool(
+        "UNSLOTH_WIKI_RAG_INCLUDE_SOURCE_PAGES",
+        _RAG_INCLUDE_SOURCE_PAGES,
+    )
+
+    # Allow high-context configurations while still guarding pathological values.
+    max_pages = max(1, min(max_pages, 64))
+    max_chars_per_page = max(200, min(max_chars_per_page, 120000))
+    max_total_chars = max(500, min(max_total_chars, 500000))
+    return max_pages, max_chars_per_page, max_total_chars, include_source_pages
 _WIKI_LLM_MAX_TOKENS = int(os.getenv("UNSLOTH_WIKI_LLM_MAX_TOKENS", "1200"))
 _WIKI_LLM_PREFER_UPSTREAM = os.getenv(
     "UNSLOTH_WIKI_LLM_PREFER_UPSTREAM",
@@ -1437,6 +1464,10 @@ def _to_rag_debug_response(payload: dict[str, Any]) -> RagContextDebugResponse:
     if not isinstance(applied_limits, dict):
         applied_limits = {}
 
+    live_max_pages, live_max_chars_per_page, live_max_total_chars, _ = (
+        _live_route_rag_limits()
+    )
+
     return RagContextDebugResponse(
         query = str(payload.get("query", "")),
         source = source,
@@ -1446,12 +1477,12 @@ def _to_rag_debug_response(payload: dict[str, Any]) -> RagContextDebugResponse:
         pages_considered = int(payload.get("pages_considered", 0)),
         selected = selected,
         applied_limits = {
-            "max_pages": int(applied_limits.get("max_pages", _RAG_MAX_PAGES)),
+            "max_pages": int(applied_limits.get("max_pages", live_max_pages)),
             "max_chars_per_page": int(
-                applied_limits.get("max_chars_per_page", _RAG_MAX_CHARS_PER_PAGE)
+                applied_limits.get("max_chars_per_page", live_max_chars_per_page)
             ),
             "max_total_chars": int(
-                applied_limits.get("max_total_chars", _RAG_MAX_TOTAL_CHARS)
+                applied_limits.get("max_total_chars", live_max_total_chars)
             ),
         },
         generated_at = str(
@@ -1473,13 +1504,28 @@ def _get_route_rag_context(
 ) -> str | tuple[str, dict[str, Any]]:
     manager, _ = _get_route_wiki_components()
     query_lower = query.lower()
-    max_pages = max_pages_override or _RAG_MAX_PAGES
-    max_chars_per_page = max_chars_per_page_override or _RAG_MAX_CHARS_PER_PAGE
-    max_total_chars = max_total_chars_override or _RAG_MAX_TOTAL_CHARS
+    (
+        live_max_pages,
+        live_max_chars_per_page,
+        live_max_total_chars,
+        include_source_pages,
+    ) = _live_route_rag_limits()
 
-    max_pages = max(1, min(max_pages, 32))
-    max_chars_per_page = max(200, min(max_chars_per_page, 12000))
-    max_total_chars = max(500, min(max_total_chars, 30000))
+    max_pages = live_max_pages if max_pages_override is None else int(max_pages_override)
+    max_chars_per_page = (
+        live_max_chars_per_page
+        if max_chars_per_page_override is None
+        else int(max_chars_per_page_override)
+    )
+    max_total_chars = (
+        live_max_total_chars
+        if max_total_chars_override is None
+        else int(max_total_chars_override)
+    )
+
+    max_pages = max(1, min(max_pages, 64))
+    max_chars_per_page = max(200, min(max_chars_per_page, 120000))
+    max_total_chars = max(500, min(max_total_chars, 500000))
 
     wants_history = _looks_like_history_intent(query)
 
@@ -1487,11 +1533,11 @@ def _get_route_rag_context(
         query,
         max_pages = max(max_pages * 4, 12),
         max_chars_per_page = max(max_chars_per_page * 6, 6000),
-        include_source_pages = _RAG_INCLUDE_SOURCE_PAGES,
+        include_source_pages = include_source_pages,
     )
     ranking_mode = str(result.get("ranking_mode", "unknown") or "unknown")
     blocks: list[dict] = result.get("context_blocks", [])
-    if not _RAG_INCLUDE_SOURCE_PAGES:
+    if not include_source_pages:
         blocks = [
             b
             for b in blocks
@@ -1549,7 +1595,7 @@ def _get_route_rag_context(
         blocks = (chat_blocks + non_chat)[:max_pages]
 
         sources_dir = _WIKI_VAULT_ROOT / "wiki" / "sources"
-        if _RAG_INCLUDE_SOURCE_PAGES and sources_dir.exists():
+        if include_source_pages and sources_dir.exists():
             history_files = sorted(
                 [p for p in sources_dir.glob("chat-history-*.md")],
                 key = lambda p: p.stat().st_mtime,
@@ -1629,7 +1675,7 @@ def _get_route_rag_context(
             else:
                 blocks = blocks[:max_pages]
 
-    if not blocks and not wants_history and _RAG_INCLUDE_SOURCE_PAGES:
+    if not blocks and not wants_history and include_source_pages:
         sources_dir = _WIKI_VAULT_ROOT / "wiki" / "sources"
         if sources_dir.exists() and (
             "resume" in query_lower
@@ -1658,7 +1704,7 @@ def _get_route_rag_context(
                     }
                 )
 
-    if not _RAG_INCLUDE_SOURCE_PAGES:
+    if not include_source_pages:
         blocks = [
             b
             for b in blocks
@@ -1681,11 +1727,42 @@ def _get_route_rag_context(
         if len(content) <= max_chars_per_page:
             return content
 
+        snippet_stopwords = {
+            "a",
+            "an",
+            "and",
+            "as",
+            "at",
+            "by",
+            "do",
+            "for",
+            "from",
+            "how",
+            "in",
+            "is",
+            "it",
+            "me",
+            "of",
+            "on",
+            "or",
+            "that",
+            "the",
+            "this",
+            "to",
+            "using",
+            "what",
+            "which",
+            "who",
+            "why",
+            "wiki",
+            "with",
+            "context",
+            "only",
+        }
         terms = [
             t
-            for t in _re.findall(r"[a-zA-Z0-9]{4,}", query_lower)
-            if t
-            not in {"using", "wiki", "context", "only", "from", "what", "which", "that"}
+            for t in _re.findall(r"[a-zA-Z0-9]{2,}", query_lower)
+            if t not in snippet_stopwords
         ]
         lowered = content.lower()
         for term in terms:
@@ -1715,6 +1792,7 @@ def _get_route_rag_context(
         "query": query,
         "source": debug_source,
         "wants_history": wants_history,
+        "include_source_pages": bool(include_source_pages),
         "ranking_mode": ranking_mode,
         "context": context,
         "context_characters": len(context),
@@ -2568,6 +2646,24 @@ async def wiki_query(
                 "Auto enrichment after query #%d failed: %s", _WIKI_QUERY_RUN_COUNT, exc
             )
 
+        try:
+            backlinks_report = manager.refresh_analysis_backlinks(dry_run = False)
+            logger.info(
+                "Auto analysis-backlinks after wiki query #%d: scanned=%d targets=%d linked=%d updated=%d removed=%d",
+                _WIKI_QUERY_RUN_COUNT,
+                int(backlinks_report.get("scanned_analysis_pages", 0)),
+                int(backlinks_report.get("target_pages", 0)),
+                int(backlinks_report.get("linked_target_pages", 0)),
+                int(backlinks_report.get("updated_pages", 0)),
+                int(backlinks_report.get("removed_sections", 0)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Auto analysis-backlinks after query #%d failed: %s",
+                _WIKI_QUERY_RUN_COUNT,
+                exc,
+            )
+
     return WikiQueryResponse(
         status = str(result.get("status", "ok")),
         answer = str(result.get("answer", "")),
@@ -2599,6 +2695,19 @@ async def wiki_lint(
             )
         except Exception as exc:
             logger.warning("Fallback-retry before /wiki/lint failed: %s", exc)
+
+    try:
+        backlinks_report = manager.refresh_analysis_backlinks(dry_run = False)
+        logger.info(
+            "Analysis-backlinks before /wiki/lint: scanned=%d targets=%d linked=%d updated=%d removed=%d",
+            int(backlinks_report.get("scanned_analysis_pages", 0)),
+            int(backlinks_report.get("target_pages", 0)),
+            int(backlinks_report.get("linked_target_pages", 0)),
+            int(backlinks_report.get("updated_pages", 0)),
+            int(backlinks_report.get("removed_sections", 0)),
+        )
+    except Exception as exc:
+        logger.warning("Analysis-backlinks before /wiki/lint failed: %s", exc)
 
     report = manager.engine.lint()
 
@@ -3639,12 +3748,19 @@ def _apply_route_rag_history_hooks_to_payload(
                 ranking_mode = str(
                     rag_debug.get("ranking_mode", "unknown") or "unknown"
                 )
+                applied_limits = rag_debug.get("applied_limits", {})
+                if not isinstance(applied_limits, dict):
+                    applied_limits = {}
                 logger.info(
-                    "RAG selection for %s request: rank_mode=%s pages=%d chars=%d selected=%s query=%r",
+                    "RAG selection for %s request: rank_mode=%s pages=%d chars=%d max_pages=%s max_chars_per_page=%s max_total_chars=%s include_sources=%s selected=%s query=%r",
                     request_label,
                     ranking_mode,
                     len(selected_pages),
                     len(rag_context),
+                    int(applied_limits.get("max_pages", 0)),
+                    int(applied_limits.get("max_chars_per_page", 0)),
+                    int(applied_limits.get("max_total_chars", 0)),
+                    bool(rag_debug.get("include_source_pages", False)),
                     selected_pages,
                     last_user_text,
                 )
@@ -5514,11 +5630,18 @@ async def openai_chat_completions(
                         ranking_mode = str(
                             rag_debug.get("ranking_mode", "unknown") or "unknown"
                         )
+                        applied_limits = rag_debug.get("applied_limits", {})
+                        if not isinstance(applied_limits, dict):
+                            applied_limits = {}
                         logger.info(
-                            "RAG selection for GGUF request: rank_mode=%s pages=%d chars=%d selected=%s query=%r",
+                            "RAG selection for GGUF request: rank_mode=%s pages=%d chars=%d max_pages=%s max_chars_per_page=%s max_total_chars=%s include_sources=%s selected=%s query=%r",
                             ranking_mode,
                             len(selected_pages),
                             len(rag_context),
+                            int(applied_limits.get("max_pages", 0)),
+                            int(applied_limits.get("max_chars_per_page", 0)),
+                            int(applied_limits.get("max_total_chars", 0)),
+                            bool(rag_debug.get("include_source_pages", False)),
                             selected_pages,
                             last_user_text,
                         )

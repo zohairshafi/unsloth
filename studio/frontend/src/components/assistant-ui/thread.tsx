@@ -735,6 +735,28 @@ const CodeToolsToggle: FC = () => {
   );
 };
 
+const AutoTitleToggle: FC = () => {
+  const autoTitle = useChatRuntimeStore((s) => s.autoTitle);
+  const setAutoTitle = useChatRuntimeStore((s) => s.setAutoTitle);
+
+  return (
+    <button
+      type="button"
+      onClick={() => setAutoTitle(!autoTitle)}
+      className={cn(
+        "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors",
+        autoTitle
+          ? "bg-primary/10 text-primary hover:bg-primary/20"
+          : "bg-muted text-muted-foreground hover:bg-muted-foreground/15",
+      )}
+      aria-label={autoTitle ? "Disable auto-title" : "Enable auto-title"}
+    >
+      <PencilIcon className="size-3.5" />
+      <span>Auto-title</span>
+    </button>
+  );
+};
+
 const WikiChatHistoryToggle: FC = () => {
   const aui = useAui();
   const threadId = useAuiState(({ threads }) => threads.mainThreadId);
@@ -883,6 +905,7 @@ const ComposerAction: FC<{ disabled?: boolean }> = ({ disabled }) => {
         <PreserveThinkingToggle />
         <WebSearchToggle />
         <CodeToolsToggle />
+        <AutoTitleToggle />
         <WikiChatHistoryToggle />
       </div>
       <div className="shrink-0 flex items-center gap-1">

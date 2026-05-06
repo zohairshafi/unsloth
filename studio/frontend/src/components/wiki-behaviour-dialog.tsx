@@ -77,7 +77,7 @@ const CATEGORY_ORDER = [
 
 type WikiVariableCategory = (typeof CATEGORY_ORDER)[number];
 
-const EXPECTED_RUNTIME_WIKI_ENV_VARS = 81;
+const EXPECTED_RUNTIME_WIKI_ENV_VARS = 86;
 
 function displayValue(value: string): string {
   if (!value) return "(empty)";

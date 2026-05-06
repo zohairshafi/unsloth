@@ -93,3 +93,25 @@ export async function deleteChatItem(
     onSelect({ mode: "single", newThreadNonce: crypto.randomUUID() });
   }
 }
+
+export async function renameChatItem(
+  item: SidebarItem,
+  nextTitle: string,
+): Promise<void> {
+  const title = nextTitle.trim();
+  if (!title) {
+    throw new Error("Title cannot be empty.");
+  }
+
+  if (item.type === "single") {
+    await db.threads.update(item.id, { title });
+    return;
+  }
+
+  await db.transaction("rw", db.threads, async () => {
+    const pairThreads = await db.threads.where("pairId").equals(item.id).toArray();
+    for (const thread of pairThreads) {
+      await db.threads.update(thread.id, { title });
+    }
+  });
+}

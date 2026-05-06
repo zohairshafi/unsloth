@@ -29,6 +29,7 @@ class _FakeWikiManager:
         self.health_calls = 0
         self.retry_fallback_calls = 0
         self.enrich_calls = 0
+        self.backlinks_calls = 0
         self._probe_sequence = list(
             probe_sequence
             or [{"used_extractive_fallback": False, "fallback_reason": None}]
@@ -111,6 +112,24 @@ class _FakeWikiManager:
             "skipped_no_question": 0,
             "errors": [],
             "results": [],
+        }
+
+    def refresh_analysis_backlinks(
+        self,
+        dry_run: bool = False,
+        max_analysis_pages: int = 256,
+        max_links_per_page: int = 128,
+    ):
+        self.backlinks_calls += 1
+        return {
+            "status": "ok",
+            "dry_run": dry_run,
+            "scanned_analysis_pages": max_analysis_pages,
+            "target_pages": max_links_per_page,
+            "linked_target_pages": 0,
+            "updated_pages": 0,
+            "removed_sections": 0,
+            "changes": [],
         }
 
 
@@ -552,6 +571,7 @@ def test_watcher_runs_enrichment_on_same_schedule_as_lint(tmp_path: Path, monkey
     assert wiki_manager.health_calls == 1
     assert wiki_manager.retry_fallback_calls == 1
     assert wiki_manager.enrich_calls == 1
+    assert wiki_manager.backlinks_calls == 1
 
 
 def test_watcher_start_schedules_raw_dir_recursively(tmp_path: Path, monkeypatch):

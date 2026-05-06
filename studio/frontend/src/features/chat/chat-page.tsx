@@ -14,6 +14,7 @@ import { Settings05Icon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Tooltip, TooltipContent } from "@/components/ui/tooltip";
 import { Tooltip as TooltipPrimitive } from "radix-ui";
+import { PencilIcon } from "lucide-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   type ReactElement,
@@ -533,6 +534,8 @@ export function ChatPage(): ReactElement {
     (state) => state.ggufContextLength,
   );
   const contextUsage = useChatRuntimeStore((state) => state.contextUsage);
+  const autoTitle = useChatRuntimeStore((state) => state.autoTitle);
+  const setAutoTitle = useChatRuntimeStore((state) => state.setAutoTitle);
   const modelsFromStore = useChatRuntimeStore((state) => state.models);
   const lorasFromStore = useChatRuntimeStore((state) => state.loras);
   const modelsError = useChatRuntimeStore((state) => state.modelsError);
@@ -961,6 +964,27 @@ export function ChatPage(): ReactElement {
                 className="h-[34px]"
               />
             ) : null}
+            <Tooltip>
+              <TooltipPrimitive.Trigger asChild>
+                <button
+                  type="button"
+                  onClick={() => setAutoTitle(!autoTitle)}
+                  className={cn(
+                    "flex h-[34px] items-center gap-1.5 rounded-[8px] px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    autoTitle
+                      ? "bg-primary/10 text-primary hover:bg-primary/20"
+                      : "text-[#383835] dark:text-[#c7c7c4] hover:bg-[#ececec] dark:hover:bg-[#2e3035] hover:text-black dark:hover:text-white",
+                  )}
+                  aria-label={autoTitle ? "Disable auto-title" : "Enable auto-title"}
+                >
+                  <PencilIcon className="size-3.5" />
+                  <span className="hidden sm:inline">Auto-title</span>
+                </button>
+              </TooltipPrimitive.Trigger>
+              <TooltipContent side="bottom" sideOffset={6}>
+                {autoTitle ? "Auto-title on" : "Auto-title off"}
+              </TooltipContent>
+            </Tooltip>
             {!settingsOpen && (
               <Tooltip>
                 <TooltipPrimitive.Trigger asChild>
